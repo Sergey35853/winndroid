@@ -1,10 +1,10 @@
-#define MyAppName "Winndroid"
+#define MyAppName "Winoid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.3"
+  #define MyAppVersion "0.1.4"
 #endif
 #define MyAppPublisher "Sergey35853"
-#define MyAppURL "https://github.com/Sergey35853/winndroid"
-#define MyAppExeName "Winndroid.cmd"
+#define MyAppURL "https://github.com/Sergey35853/winoid"
+#define MyAppExeName "Winoid.cmd"
 
 [Setup]
 AppId={{7B255843-360F-4186-9FF3-5EC09BCE31F6}
@@ -14,19 +14,19 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
-DefaultDirName={autopf}\Winndroid
+DefaultDirName={autopf}\Winoid
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE
 OutputDir=..\dist
-OutputBaseFilename=Winndroid-Setup-{#MyAppVersion}
-SetupIconFile=..\assets\winndroid.ico
+OutputBaseFilename=Winoid-Setup-{#MyAppVersion}
+SetupIconFile=..\assets\winoid.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}\assets\winndroid.ico
+UninstallDisplayIcon={app}\assets\winoid.ico
 MinVersion=10.0.19041
 
 [Languages]
@@ -38,19 +38,19 @@ Name: "downloadadb"; Description: "Download Android platform-tools (adb)"; Group
 Name: "setupbackend"; Description: "Open Android backend setup after installation (experimental)"; GroupDescription: "Components:"; Flags: unchecked
 
 [Files]
-Source: "..\Winndroid.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Winndroid.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Winoid.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Winoid.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Setup-Backend.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.example.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\assets\winndroid.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\assets\winoid.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\docs\screenshot-manager.png"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "Setup-ADB.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winndroid.ico"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winndroid.ico"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winoid.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winoid.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Setup-ADB.ps1"""; StatusMsg: "Downloading Android platform-tools..."; Flags: runhidden waituntilterminated; Tasks: downloadadb
@@ -66,7 +66,7 @@ begin
   if not Exec('pwsh.exe', '-NoProfile -Command "exit 0"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
     if MsgBox('PowerShell 7 was not found.' + #13#10 + #13#10 +
-              'Winndroid needs PowerShell 7. Install it from https://aka.ms/powershell, then run Winndroid again.' + #13#10 + #13#10 +
+              'Winoid needs PowerShell 7. Install it from https://aka.ms/powershell, then run Winoid again.' + #13#10 + #13#10 +
               'Continue the installation anyway?', mbConfirmation, MB_YESNO) = IDNO then
       Result := False;
   end;

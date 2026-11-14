@@ -1,6 +1,6 @@
 # WSL-ядро с binder для Waydroid
 
-Готовая сборка ядра WSL2, с которой работает бэкенд Winndroid.
+Готовая сборка ядра WSL2, с которой работает бэкенд Winoid.
 
 ## Файлы
 
@@ -63,7 +63,7 @@ depmod -a "$(uname -r)"
 
 ```ini
 [wsl2]
-kernel=C:\\Users\\<user>\\AppData\\Local\\Winndroid\\kernel\\bzImage
+kernel=C:\\Users\\<user>\\AppData\\Local\\Winoid\\kernel\\bzImage
 ```
 
 После изменения `.wslconfig` выполните `wsl --shutdown` и запустите WSL снова.

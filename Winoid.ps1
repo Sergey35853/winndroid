@@ -7,10 +7,26 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinoidActivate {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+"@
+
 $script:baseDir = $PSScriptRoot
-$script:instanceMutex = New-Object System.Threading.Mutex($false, 'Local\WinndroidManager')
+$script:instanceMutex = New-Object System.Threading.Mutex($false, 'Local\WinoidManager')
 if (-not $script:instanceMutex.WaitOne(0)) {
-    [System.Windows.MessageBox]::Show('Winndroid уже запущен.', 'Winndroid') | Out-Null
+    $existing = [WinoidActivate]::FindWindow($null, 'Winoid')
+    if ($existing -ne [IntPtr]::Zero) {
+        [void][WinoidActivate]::ShowWindow($existing, 9)
+        [void][WinoidActivate]::SetForegroundWindow($existing)
+    } else {
+        [System.Windows.MessageBox]::Show('Winoid уже запущен.', 'Winoid') | Out-Null
+    }
     exit
 }
 
@@ -200,6 +216,7 @@ $script:installTicks = 0
 $script:sessionJob = $null
 $script:sessionTicks = 0
 $script:sessionWaiting = $false
+$script:wslKeepAlive = $null
 
 $script:wrappers = New-Object System.Collections.ArrayList
 $script:wrapByImage = @{}
@@ -211,9 +228,50 @@ $script:adbSerial = '192.168.240.112:5555'
 $script:adbCheckedAt = [DateTime]::MinValue
 $script:wslDistro = ''
 
-# Optional config: %LOCALAPPDATA%\Winndroid\config.json
-# { "wslDistro": "Winndroid", "adbSerial": "192.168.240.112:5555" }
-$script:configDir = Join-Path $env:LOCALAPPDATA 'Winndroid'
+# One-time migration from the old Winndroid data directory.
+function Initialize-WinoidData {
+    $newRoot = Join-Path $env:LOCALAPPDATA 'Winoid'
+    $oldRoot = Join-Path $env:LOCALAPPDATA 'Winndroid'
+    $moved = $false
+    if ((Test-Path -LiteralPath $oldRoot) -and -not (Test-Path -LiteralPath $newRoot)) {
+        try {
+            Move-Item -LiteralPath $oldRoot -Destination $newRoot -ErrorAction Stop
+            $moved = $true
+        } catch { }
+    }
+    if ($moved) {
+        try {
+            $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
+            if (Test-Path -LiteralPath $wslConfig) {
+                $changed = $false
+                $out = foreach ($line in @(Get-Content -LiteralPath $wslConfig)) {
+                    if ($line -match '^\s*kernel=' -and $line -match '[\\/]Winndroid[\\/]') {
+                        $changed = $true
+                        $line.Replace('\\Winndroid\\', '\\Winoid\\').Replace('\Winndroid\', '\Winoid\')
+                    } else { $line }
+                }
+                if ($changed) {
+                    Copy-Item -LiteralPath $wslConfig -Destination ("$wslConfig.winoid-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak') -Force
+                    Set-Content -LiteralPath $wslConfig -Value ($out -join "`r`n") -Encoding utf8NoBOM
+                }
+            }
+        } catch {
+            try {
+                if (-not (Test-Path -LiteralPath $oldRoot) -and (Test-Path -LiteralPath $newRoot)) {
+                    Move-Item -LiteralPath $newRoot -Destination $oldRoot -ErrorAction Stop
+                }
+            } catch { }
+            return $oldRoot
+        }
+    }
+    if (Test-Path -LiteralPath $newRoot) { return $newRoot }
+    return $oldRoot
+}
+
+# Optional config: %LOCALAPPDATA%\Winoid\config.json
+# { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
+$script:dataRoot = Initialize-WinoidData
+$script:configDir = $script:dataRoot
 $script:configPath = Join-Path $script:configDir 'config.json'
 if (Test-Path -LiteralPath $script:configPath) {
     try {
@@ -222,13 +280,13 @@ if (Test-Path -LiteralPath $script:configPath) {
         if ($cfg.adbSerial) { $script:adbSerial = [string]$cfg.adbSerial }
     } catch { }
 }
-if ($env:WINNDROID_WSL_DISTRO) { $script:wslDistro = $env:WINNDROID_WSL_DISTRO }
-if ($env:WINNDROID_ADB_SERIAL) { $script:adbSerial = $env:WINNDROID_ADB_SERIAL }
+if ($env:WINOID_WSL_DISTRO) { $script:wslDistro = $env:WINOID_WSL_DISTRO }
+if ($env:WINOID_ADB_SERIAL) { $script:adbSerial = $env:WINOID_ADB_SERIAL }
 
 $mainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Winndroid" Height="700" Width="1040" MinHeight="520" MinWidth="820"
+        Title="Winoid" Height="700" Width="1040" MinHeight="520" MinWidth="820"
         WindowStartupLocation="CenterScreen" Background="#141519" Foreground="#F1F3F5"
         FontFamily="Segoe UI" AllowDrop="True" UseLayoutRounding="True">
   <Window.Resources>
@@ -315,7 +373,7 @@ $mainXaml = @'
         <ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
       <StackPanel>
-        <TextBlock Text="Winndroid" FontSize="28" FontWeight="SemiBold"/>
+        <TextBlock Text="Winoid" FontSize="28" FontWeight="SemiBold"/>
         <TextBlock Text="Android-приложения в отдельных окнах Windows" FontSize="12" Foreground="#8D929C" Margin="0,2,0,0"/>
       </StackPanel>
       <Border Grid.Column="1" Background="#1E2027" BorderBrush="#2E3139" BorderThickness="1" CornerRadius="20" Padding="14,7" VerticalAlignment="Center">
@@ -395,7 +453,7 @@ $mainXaml = @'
 $loaderXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="WinndroidLoader" Width="500" Height="248"
+        Title="WinoidLoader" Width="500" Height="248"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         ShowInTaskbar="False" Topmost="True" WindowStartupLocation="CenterScreen" ResizeMode="NoResize">
   <Border Background="#1D1F25" BorderBrush="#3A3D46" BorderThickness="1" CornerRadius="16" Padding="24">
@@ -458,7 +516,7 @@ $window = [System.Windows.Markup.XamlReader]::Parse($mainXaml)
 $loader = [System.Windows.Markup.XamlReader]::Parse($loaderXaml)
 
 $script:appIcon = $null
-$iconPath = Join-Path $PSScriptRoot 'assets\winndroid.ico'
+$iconPath = Join-Path $PSScriptRoot 'assets\winoid.ico'
 if (Test-Path -LiteralPath $iconPath) {
     try {
         $script:appIcon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconPath))
@@ -539,6 +597,22 @@ function Start-WslDetached {
     [void][System.Diagnostics.Process]::Start($psi)
 }
 
+# WSL stops the VM after about a minute without an active wsl.exe client.
+# A sleeping client keeps the Android session alive while the manager is open.
+function Start-WslKeepAlive {
+    if ($script:wslKeepAlive -and -not $script:wslKeepAlive.HasExited) { return }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $script:wsl
+    foreach ($a in ((Get-WslBase) + @('--', 'bash', '-lc', 'exec sleep 86400'))) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    try {
+        $script:wslKeepAlive = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        $script:wslKeepAlive = $null
+    }
+}
+
 function Get-WaydroidStatus {
     $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'waydroid', 'status')) 15000
     if ($r.Out -match '(?m)^Session:\s*(\S+)') { return $matches[1] }
@@ -546,9 +620,9 @@ function Get-WaydroidStatus {
 }
 
 function Test-Backend {
-    $cmd = 'command -v waydroid >/dev/null 2>&1 && echo WINNDROID_BACKEND_OK'
+    $cmd = 'command -v waydroid >/dev/null 2>&1 && echo WINOID_BACKEND_OK'
     $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 10000
-    return ($r.Out -match 'WINNDROID_BACKEND_OK')
+    return ($r.Out -match 'WINOID_BACKEND_OK')
 }
 
 function Test-Session {
@@ -780,7 +854,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.LastMoveT = [DateTime]::MinValue
 
     $win = [System.Windows.Markup.XamlReader]::Parse($script:wrapperXaml)
-    $win.Title = "$($app.Name) — Winndroid"
+    $win.Title = "$($app.Name) — Winoid"
     if ($null -ne $script:appIcon) { $win.Icon = $script:appIcon }
     $image = $win.FindName('View')
     $hint = $win.FindName('Hint')
@@ -948,6 +1022,7 @@ $script:frameTimer.Add_Tick({
         }
         if (([DateTime]::UtcNow - $script:adbCheckedAt).TotalSeconds -ge 5) {
             $script:adbCheckedAt = [DateTime]::UtcNow
+            if ($null -eq $script:wslKeepAlive -or $script:wslKeepAlive.HasExited) { Start-WslKeepAlive }
             if ($null -eq $script:adb -or -not $script:adb.Running) {
                 if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
                 if ($script:sessionRunning) { Initialize-Adb }
@@ -969,7 +1044,7 @@ $launchTimer.Add_Tick({
     elseif ($sec -eq 30) { $loaderSub.Text = 'Идёт первый запуск. Android распаковывает данные и транслирует ARM-код — это может занять несколько минут.' }
     elseif ($sec -eq 90) { $loaderSub.Text = 'Всё ещё загружается. Не закрывайте приложение; индикатор можно скрыть.' }
 
-    $h = [NativeWin]::FindWindowContains($st.App.Name, 'Winndroid')
+    $h = [NativeWin]::FindWindowContains($st.App.Name, 'Winoid')
     if ($h -ne [IntPtr]::Zero) {
         $st.Hwnd = $h
         if (-not $st.Wrapped) {
@@ -1044,10 +1119,10 @@ $installTimer.Add_Tick({
         $installTimer.Stop()
         $loader.Hide()
         Refresh-Apps
-        $last = (($out -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 -and $_ -notmatch '^WINNDROID_INSTALL_EXIT=' } | Select-Object -Last 1)
-        if ($out -match 'WINNDROID_INSTALL_EXIT=0') { Set-Footer 'APK установлен.' }
+        $last = (($out -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 -and $_ -notmatch '^WINOID_INSTALL_EXIT=' } | Select-Object -Last 1)
+        if ($out -match 'WINOID_INSTALL_EXIT=0') { Set-Footer 'APK установлен.' }
         elseif ($last) { Set-Footer "Установка не удалась: $last" }
-        else { Set-Footer 'Установка не удалась. Подробности: %LOCALAPPDATA%\Winndroid\install.log' }
+        else { Set-Footer 'Установка не удалась. Подробности: %LOCALAPPDATA%\Winoid\install.log' }
     }
 })
 
@@ -1056,7 +1131,7 @@ function Install-Apk([string]$path) {
     $apk = (Resolve-Path -LiteralPath $path).Path
     Initialize-Adb
     if (-not $script:adbPath) {
-        Set-Footer 'ADB не найден. Установите platform-tools или положите adb.exe рядом с Winndroid.ps1.'
+        Set-Footer 'ADB не найден. Установите platform-tools или положите adb.exe рядом с Winoid.ps1.'
         return
     }
 
@@ -1078,12 +1153,12 @@ function Install-Apk([string]$path) {
         foreach ($l in @($out)) { [void]$lines.Add([string]$l) }
         [void]$lines.Add("install exit=$code")
         try {
-            $logRoot = Join-Path $env:LOCALAPPDATA 'Winndroid'
+            $logRoot = $script:dataRoot
             if (-not (Test-Path -LiteralPath $logRoot)) { New-Item -ItemType Directory -Path $logRoot -Force | Out-Null }
-            Add-Content -LiteralPath (Join-Path $logRoot 'install.log') -Value (($lines -join "`r`n") + "`r`nWINNDROID_INSTALL_EXIT=$code") -Encoding UTF8
+            Add-Content -LiteralPath (Join-Path $logRoot 'install.log') -Value (($lines -join "`r`n") + "`r`nWINOID_INSTALL_EXIT=$code") -Encoding UTF8
         } catch { }
         foreach ($l in $lines) { $l }
-        "WINNDROID_INSTALL_EXIT=$code"
+        "WINOID_INSTALL_EXIT=$code"
     } -ArgumentList $jobAdb, $jobSerial, $apk
     $installTimer.Start()
 }
@@ -1171,7 +1246,7 @@ $backendBtn.Add_Click({
         Start-Process -FilePath 'pwsh.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$setup`"" -WorkingDirectory $script:baseDir
         Set-Footer 'Открыл настройку Android в отдельном окне.'
     } else {
-        Start-Process 'https://github.com/Sergey35853/winndroid/blob/main/README.md#как-поднять-бэкенд'
+        Start-Process 'https://github.com/Sergey35853/winoid/blob/main/README.md#как-поднять-бэкенд'
         Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
     }
 })
@@ -1220,9 +1295,15 @@ $window.Add_Closing({
     if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
     if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
     if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
+    if ($script:wslKeepAlive) {
+        try { if (-not $script:wslKeepAlive.HasExited) { $script:wslKeepAlive.Kill() } } catch { }
+        try { $script:wslKeepAlive.Dispose() } catch { }
+        $script:wslKeepAlive = $null
+    }
 })
 $window.Add_Closed({ [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() })
 $window.Add_Loaded({
+    Start-WslKeepAlive
     Test-Session | Out-Null
     Refresh-Apps
     Initialize-Adb

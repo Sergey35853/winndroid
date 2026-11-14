@@ -1,17 +1,21 @@
-# Winndroid
+# Winoid
 
 Android-приложения и игры в отдельных окнах Windows. Внутри — WSL2, Waydroid
 (LineageOS) и менеджер на PowerShell 7 + WPF.
 
-**[Скачать установщик](https://github.com/Sergey35853/winndroid/releases/latest)**
-· [Исходники и portable-zip](https://github.com/Sergey35853/winndroid/releases)
+> **Переименование.** Проект назывался Winndroid. Настройки, platform-tools и
+> ядро из `%LOCALAPPDATA%\Winndroid` переносятся в `%LOCALAPPDATA%\Winoid`
+> автоматически при первом запуске.
+
+**[Скачать установщик](https://github.com/Sergey35853/winoid/releases/latest)**
+· [Исходники и portable-zip](https://github.com/Sergey35853/winoid/releases)
 
 > **Статус: альфа.** Проект личный, публикуется для энтузиастов. Бэкенд
 > (WSL-ядро с binder, Waydroid, GApps, libndk) ставится кнопкой
 > **«Настроить Android»** в менеджере (экспериментально). Ядро, GApps и libndk
 > скачиваются на машине пользователя и не входят в поставку.
 
-![Менеджер Winndroid](docs/screenshot-manager.png)
+![Менеджер Winoid](docs/screenshot-manager.png)
 
 ## Что умеет
 
@@ -69,7 +73,7 @@ GApps, Play Store и libndk **не входят** в поставку: скри�
    adb devices
    ```
 
-3. Запустите `Winndroid.cmd` (или `pwsh -File Winndroid.ps1` из исходников).
+3. Запустите `Winoid.cmd` (или `pwsh -File Winoid.ps1` из исходников).
 
 4. Выберите приложение и нажмите «Запустить в отдельном окне». Двойной клик
    по строке делает то же самое.
@@ -77,7 +81,7 @@ GApps, Play Store и libndk **не входят** в поставку: скри�
 ## Настройка
 
 Менеджер читает необязательный файл
-`%LOCALAPPDATA%\Winndroid\config.json`:
+`%LOCALAPPDATA%\Winoid\config.json`:
 
 ```json
 {
@@ -91,13 +95,13 @@ GApps, Play Store и libndk **не входят** в поставку: скри�
 - `adbSerial` — адрес Android для ADB. По умолчанию Waydroid использует
   `192.168.240.112:5555`.
 
-Переменные окружения `WINNDROID_WSL_DISTRO` и `WINNDROID_ADB_SERIAL` имеют
+Переменные окружения `WINOID_WSL_DISTRO` и `WINOID_ADB_SERIAL` имеют
 приоритет над файлом.
 
 ADB ищется по порядку:
 
-1. `platform-tools\adb.exe` рядом с `Winndroid.ps1`;
-2. `%LOCALAPPDATA%\Winndroid\platform-tools\adb.exe`;
+1. `platform-tools\adb.exe` рядом с `Winoid.ps1`;
+2. `%LOCALAPPDATA%\Winoid\platform-tools\adb.exe`;
 3. `adb.exe` в `PATH`;
 4. `%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe`;
 5. `C:\platform-tools\adb.exe`.
@@ -110,7 +114,7 @@ ADB ищется по порядку:
 1. Проверит WSL2 и Ubuntu 24.04; при отсутствии предложит установить
    дистрибутив.
 2. Скачает ядро с binder и минимальные модули из релиза
-   [`kernel-6.18.58.1`](https://github.com/Sergey35853/winndroid/releases/tag/kernel-6.18.58.1),
+   [`kernel-6.18.58.1`](https://github.com/Sergey35853/winoid/releases/tag/kernel-6.18.58.1),
    сохранит резервную копию `.wslconfig` и перезапустит WSL.
 3. Установит Waydroid из `repo.waydro.id`.
 4. Скачает образы Android с GAPPS (около 3 ГБ) с `ota.waydro.id`.
@@ -145,13 +149,13 @@ pwsh -File .\Setup-Backend.ps1 -Mode Install -DryRun  # показать пла�
    ```
 
 2. Возьмите готовое ядро и модули из релиза
-   [`kernel-6.18.58.1`](https://github.com/Sergey35853/winndroid/releases/tag/kernel-6.18.58.1)
+   [`kernel-6.18.58.1`](https://github.com/Sergey35853/winoid/releases/tag/kernel-6.18.58.1)
    (или соберите по [`kernel/README.md`](kernel/README.md)) и укажите ядро в
    `%UserProfile%\.wslconfig`:
 
    ```ini
    [wsl2]
-   kernel=C:\\Users\\<user>\\AppData\\Local\\Winndroid\\kernel\\bzImage
+   kernel=C:\\Users\\<user>\\AppData\\Local\\Winoid\\kernel\\bzImage
    ```
 
    Модули распакуйте в `/lib/modules/$(uname -r)/` и выполните
@@ -237,16 +241,16 @@ pwsh -File .\Setup-Backend.ps1 -Mode Install -DryRun  # показать пла�
 
 ```powershell
 # запуск из исходников
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winndroid.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winoid.ps1
 
 # автозапуск приложения для проверки
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winndroid.ps1 -Launch org.telegram.messenger
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winoid.ps1 -Launch org.telegram.messenger
 
 # установка APK без диалога
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winndroid.ps1 -Install C:\path\app.apk
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winoid.ps1 -Install C:\path\app.apk
 ```
 
-Основные части `Winndroid.ps1`:
+Основные части `Winoid.ps1`:
 
 - `NativeWin` — Win32: поиск окон, `PrintWindow`, стили, фокус.
 - `FrameGrabber` — DIB-секция и захват кадра без копирования 14 МБ на кадр.
@@ -259,10 +263,10 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Winndroid.ps1 -Install C:\path\a
 
 ```powershell
 winget install JRSoftware.InnoSetup
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\Winndroid.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\Winoid.iss
 ```
 
-Готовый файл появится в `dist\Winndroid-Setup-<версия>.exe`. GitHub Actions
+Готовый файл появится в `dist\Winoid-Setup-<версия>.exe`. GitHub Actions
 собирает установщик и portable-zip по тегу `v*` и прикрепляет их к релизу.
 
 ## Лицензии и благодарности

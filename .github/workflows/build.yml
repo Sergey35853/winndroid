@@ -21,7 +21,7 @@ jobs:
           $tokens = $null
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'Winndroid.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+            (Join-Path $PWD 'Winoid.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) {
             $errors | ForEach-Object { Write-Error ("{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
             exit 1
@@ -47,7 +47,7 @@ jobs:
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "installer\Winndroid.iss"
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "installer\Winoid.iss"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build portable archive
@@ -55,17 +55,17 @@ jobs:
         run: |
           $stage = Join-Path $PWD 'stage'
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item Winndroid.ps1, Winndroid.cmd, Setup-Backend.ps1, README.md, LICENSE, config.example.json $stage
+          Copy-Item Winoid.ps1, Winoid.cmd, Setup-Backend.ps1, README.md, LICENSE, config.example.json $stage
           Copy-Item assets $stage -Recurse
           Copy-Item docs $stage -Recurse
-          $zip = "dist\Winndroid-${{ steps.ver.outputs.version }}-portable.zip"
+          $zip = "dist\Winoid-${{ steps.ver.outputs.version }}-portable.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
-          name: Winndroid-${{ steps.ver.outputs.version }}
+          name: Winoid-${{ steps.ver.outputs.version }}
           path: dist/*
           if-no-files-found: error
 
@@ -77,12 +77,12 @@ jobs:
         run: |
           $tag = '${{ github.ref_name }}'
           $files = @(
-            "dist\Winndroid-Setup-${{ steps.ver.outputs.version }}.exe",
-            "dist\Winndroid-${{ steps.ver.outputs.version }}-portable.zip"
+            "dist\Winoid-Setup-${{ steps.ver.outputs.version }}.exe",
+            "dist\Winoid-${{ steps.ver.outputs.version }}-portable.zip"
           )
           gh release view $tag 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @files --clobber
           } else {
-            gh release create $tag @files --title "Winndroid $tag" --generate-notes
+            gh release create $tag @files --title "Winoid $tag" --generate-notes
           }

@@ -12,22 +12,61 @@ $env:WSL_UTF8 = '1'
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     $OutputEncoding = [System.Text.Encoding]::UTF8
-    $Host.UI.RawUI.WindowTitle = 'Winndroid — настройка Android'
+    $Host.UI.RawUI.WindowTitle = 'Winoid — настройка Android'
 } catch { }
 
+function Initialize-WinoidRoot {
+    $newRoot = Join-Path $env:LOCALAPPDATA 'Winoid'
+    $oldRoot = Join-Path $env:LOCALAPPDATA 'Winndroid'
+    $moved = $false
+    if ((Test-Path -LiteralPath $oldRoot) -and -not (Test-Path -LiteralPath $newRoot)) {
+        try {
+            Move-Item -LiteralPath $oldRoot -Destination $newRoot -ErrorAction Stop
+            $moved = $true
+        } catch { }
+    }
+    if ($moved) {
+        try {
+            $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
+            if (Test-Path -LiteralPath $wslConfig) {
+                $changed = $false
+                $out = foreach ($line in @(Get-Content -LiteralPath $wslConfig)) {
+                    if ($line -match '^\s*kernel=' -and $line -match '[\\/]Winndroid[\\/]') {
+                        $changed = $true
+                        $line.Replace('\\Winndroid\\', '\\Winoid\\').Replace('\Winndroid\', '\Winoid\')
+                    } else { $line }
+                }
+                if ($changed) {
+                    Copy-Item -LiteralPath $wslConfig -Destination ("$wslConfig.winoid-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak') -Force
+                    Set-Content -LiteralPath $wslConfig -Value ($out -join "`r`n") -Encoding utf8NoBOM
+                }
+            }
+        } catch {
+            try {
+                if (-not (Test-Path -LiteralPath $oldRoot) -and (Test-Path -LiteralPath $newRoot)) {
+                    Move-Item -LiteralPath $newRoot -Destination $oldRoot -ErrorAction Stop
+                }
+            } catch { }
+            return $oldRoot
+        }
+    }
+    if (Test-Path -LiteralPath $newRoot) { return $newRoot }
+    return $oldRoot
+}
+
 $script:Wsl          = Join-Path $env:SystemRoot 'System32\wsl.exe'
-$script:Root         = Join-Path $env:LOCALAPPDATA 'Winndroid'
+$script:Root         = Initialize-WinoidRoot
 $script:ConfigPath   = Join-Path $script:Root 'config.json'
 $script:LogPath      = Join-Path $script:Root 'setup-backend.log'
 $script:KernelDir    = Join-Path $script:Root 'kernel'
 $script:KernelTag    = 'kernel-6.18.58.1'
 $script:KernelVer    = '6.18.58.1'
-$script:KernelUrl    = "https://github.com/Sergey35853/winndroid/releases/download/$($script:KernelTag)/bzImage-$($script:KernelVer)"
-$script:ModulesUrl   = "https://github.com/Sergey35853/winndroid/releases/download/$($script:KernelTag)/modules-slim-$($script:KernelVer).tar.gz"
+$script:KernelUrl    = "https://github.com/Sergey35853/winoid/releases/download/$($script:KernelTag)/bzImage-$($script:KernelVer)"
+$script:ModulesUrl   = "https://github.com/Sergey35853/winoid/releases/download/$($script:KernelTag)/modules-slim-$($script:KernelVer).tar.gz"
 $script:KernelSha    = 'B620BD76366DAEFCB0FC010918B46FA7CBB21B70BA989EB59341A7EC9349C34A'
 $script:ModulesSha   = '0AD711FA66CCA33ED313E03534940FE281E6ACD81C553F5D75F69DF2C4F03ACE'
 $script:AdbSerial    = '192.168.240.112:5555'
-$script:ReadmeUrl    = 'https://github.com/Sergey35853/winndroid/blob/main/README.md#как-поднять-бэкенд'
+$script:ReadmeUrl    = 'https://github.com/Sergey35853/winoid/blob/main/README.md#как-поднять-бэкенд'
 
 if (-not (Test-Path -LiteralPath $script:Root)) {
     New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
@@ -204,6 +243,7 @@ echo "USER=$user"
 echo "UID=$uid"
 if id "$user" >/dev/null 2>&1; then
   if [ -f "/home/$user/.config/systemd/user/waydroid-session.service" ]; then echo SERVICE_FILE_OK; else echo SERVICE_FILE_MISSING; fi
+  if grep -q '^Restart=always' "/home/$user/.config/systemd/user/waydroid-session.service" 2>/dev/null; then echo SERVICE_CURRENT; else echo SERVICE_OLD; fi
 fi
 linger=$(loginctl show-user "$user" -p Linger 2>/dev/null | cut -d= -f2)
 [ "$linger" = "yes" ] && echo LINGER_OK || echo LINGER_OFF
@@ -224,6 +264,7 @@ echo "SESSION=$session"
         User        = $user
         Uid         = $uid
         ServiceFile = ($r.Out -match 'SERVICE_FILE_OK')
+        ServiceCurrent = ($r.Out -match 'SERVICE_CURRENT')
         Linger      = ($r.Out -match 'LINGER_OK')
         Session     = $session
     }
@@ -239,8 +280,8 @@ function Find-Adb {
 
 function Install-Adb {
     $dest = Join-Path $script:Root 'platform-tools'
-    $zip = Join-Path $env:TEMP 'winndroid-platform-tools.zip'
-    $tmp = Join-Path $env:TEMP ('winndroid-pt-' + [Guid]::NewGuid().ToString('N'))
+    $zip = Join-Path $env:TEMP 'winoid-platform-tools.zip'
+    $tmp = Join-Path $env:TEMP ('winoid-pt-' + [Guid]::NewGuid().ToString('N'))
     Write-Step 'Скачиваю Android platform-tools'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip' -OutFile $zip -UseBasicParsing
@@ -311,6 +352,35 @@ function Get-AdbState([string]$Serial) {
         Online = ($devices -match ([regex]::Escape($Serial) + '\s+device'))
         Serial = $Serial
     }
+}
+
+function Enable-WindowsAdbKey([string]$DistroName) {
+    $adb = Find-Adb
+    if (-not $adb) { return }
+    $keyDir = Join-Path $env:USERPROFILE '.android'
+    $keyPath = Join-Path $keyDir 'adbkey'
+    $pubPath = "$keyPath.pub"
+    if (-not (Test-Path -LiteralPath $pubPath)) {
+        if (-not (Test-Path -LiteralPath $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
+        $null = & $adb keygen $keyPath 2>&1
+    }
+    if (-not (Test-Path -LiteralPath $pubPath)) { throw 'Не удалось создать ключ ADB для Windows.' }
+    $key = (Get-Content -LiteralPath $pubPath -Raw).Trim()
+    if (-not $key) { throw 'Ключ ADB для Windows пуст.' }
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($key))
+    $scriptText = @"
+set -e
+printf '%s' '$b64' | base64 -d > /tmp/winoid-adbkey.pub
+lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- sh -c '
+k=`$(cat)
+grep -qF "`$k" /data/misc/adb/adb_keys 2>/dev/null || echo "`$k" >> /data/misc/adb/adb_keys
+chown system:shell /data/misc/adb/adb_keys
+chmod 640 /data/misc/adb/adb_keys
+' < /tmp/winoid-adbkey.pub
+rm -f /tmp/winoid-adbkey.pub
+"@
+    $r = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture -TimeoutSeconds 60
+    if ($r.Code -ne 0) { throw "Не удалось авторизовать ключ ADB: $($r.Err.Trim())" }
 }
 
 function Show-Status([string]$DistroName) {
@@ -425,12 +495,12 @@ fi
             }
 
             $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
-            $backup = "$wslConfig.winndroid-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+            $backup = "$wslConfig.winoid-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
             if (Test-Path -LiteralPath $wslConfig) {
                 Copy-Item -LiteralPath $wslConfig -Destination $backup
                 $lines = @(Get-Content -LiteralPath $wslConfig)
             } else { $lines = @() }
-            $kernelValue = 'kernel=' + ($bz -replace '\\', '\\\\')
+            $kernelValue = 'kernel=' + ($bz -replace '\\', '\\')
             $out = New-Object System.Collections.Generic.List[string]
             $inWsl2 = $false
             $sectionSeen = $false
@@ -478,11 +548,11 @@ fi
         Write-Step 'Установка модулей ядра'
         if ($DryRun) { Write-Info "Будет скачано: $script:ModulesUrl"; }
         else {
-            $tarWindows = Join-Path $env:TEMP 'winndroid-modules-slim.tar.gz'
+            $tarWindows = Join-Path $env:TEMP 'winoid-modules-slim.tar.gz'
             if (-not (Test-Path -LiteralPath $tarWindows) -or (Get-FileHash -LiteralPath $tarWindows -Algorithm SHA256).Hash -ne $script:ModulesSha) {
                 Save-RemoteFile $script:ModulesUrl $tarWindows $script:ModulesSha
             }
-            $tarLinux = (Invoke-WslCapture @('-d', $DistroName, '--', 'wslpath', '-a', $tarWindows) 30).Out.Trim()
+            $tarLinux = (Invoke-WslCapture @('-d', $DistroName, '--', 'wslpath', '-a', ($tarWindows -replace '\\', '/')) 120).Out.Trim()
             if (-not $tarLinux) { throw 'Не удалось получить путь к архиву модулей внутри WSL.' }
             $scriptText = @'
 set -e
@@ -490,6 +560,17 @@ ver=$(uname -r)
 mkdir -p "/lib/modules/$ver"
 tar -xzf '__TAR__' -C "/lib/modules/$ver"
 depmod -a "$ver"
+cat >/etc/modules-load.d/winoid.conf <<'EOF'
+xt_conntrack
+xt_CHECKSUM
+xt_MASQUERADE
+iptable_mangle
+iptable_nat
+iptable_filter
+ip_tables
+br_netfilter
+EOF
+modprobe -a xt_conntrack xt_CHECKSUM xt_MASQUERADE iptable_mangle iptable_nat iptable_filter ip_tables br_netfilter 2>/dev/null || true
 '@
             $scriptText = $scriptText -replace '__TAR__', ($tarLinux -replace "'", "'\''")
             $r = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture
@@ -504,21 +585,21 @@ depmod -a "$ver"
     $session = Get-SessionState $DistroName
     if ($session.User -eq 'root') {
         Write-Step 'Создание пользователя для сессии Waydroid'
-        if ($DryRun) { Write-Info 'Будет создан пользователь winndroid и назначен пользователем по умолчанию.'; }
+        if ($DryRun) { Write-Info 'Будет создан пользователь winoid и назначен пользователем по умолчанию.'; }
         else {
-            if (-not (Confirm-Action 'WSL работает от root. Создать пользователя winndroid для WSLg и сессии Waydroid?')) { throw 'Нужен обычный пользователь в WSL.' }
+            if (-not (Confirm-Action 'WSL работает от root. Создать пользователя winoid для WSLg и сессии Waydroid?')) { throw 'Нужен обычный пользователь в WSL.' }
             $scriptText = @'
 set -e
-if ! id winndroid >/dev/null 2>&1; then
-  useradd -m -s /bin/bash winndroid
+if ! id winoid >/dev/null 2>&1; then
+  useradd -m -s /bin/bash winoid
 fi
-usermod -aG sudo winndroid 2>/dev/null || true
-echo 'winndroid ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/winndroid
-chmod 440 /etc/sudoers.d/winndroid
+usermod -aG sudo winoid 2>/dev/null || true
+echo 'winoid ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/winoid
+chmod 440 /etc/sudoers.d/winoid
 if grep -q '^\[user\]' /etc/wsl.conf 2>/dev/null; then
-  sed -i '/^\[user\]/a default=winndroid' /etc/wsl.conf
+  sed -i '/^\[user\]/a default=winoid' /etc/wsl.conf
 else
-  printf '\n[user]\ndefault=winndroid\n' >> /etc/wsl.conf
+  printf '\n[user]\ndefault=winoid\n' >> /etc/wsl.conf
 fi
 '@
             $r = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture
@@ -526,8 +607,8 @@ fi
             [void](Invoke-WslCapture @('--terminate', $DistroName) 30)
             Start-Sleep -Seconds 2
             $session = Get-SessionState $DistroName
-            if ($session.User -ne 'winndroid') { throw 'Не удалось переключить WSL на пользователя winndroid.' }
-            Write-Ok 'Пользователь winndroid создан'
+            if ($session.User -ne 'winoid') { throw 'Не удалось переключить WSL на пользователя winoid.' }
+            Write-Ok 'Пользователь winoid создан'
         }
     }
 
@@ -643,14 +724,14 @@ systemctl start waydroid-container.service 2>/dev/null || true
 
     # session service
     $session = Get-SessionState $DistroName
-    if (-not $session.ServiceFile -or -not $session.Linger) {
+    if (-not $session.ServiceFile -or -not $session.ServiceCurrent -or -not $session.Linger) {
         Write-Step 'Сервис автозапуска сессии Waydroid'
         if ($DryRun) { Write-Info 'Будет создан waydroid-session.service и включён linger'; }
         else {
             $user = $session.User
             $uid = $session.Uid
             if (-not $uid) { throw 'Не удалось определить пользователя WSL.' }
-            $unit = @"
+            $unit = @'
 [Unit]
 Description=Waydroid session (Android apps in separate windows)
 After=dbus.service
@@ -658,23 +739,24 @@ Wants=dbus.service
 
 [Service]
 Type=simple
-Environment=XDG_RUNTIME_DIR=/run/user/$uid
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=DISPLAY=:0
 Environment=PULSE_SERVER=unix:/mnt/wslg/PulseServer
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 60 ]; do if [ -e "$XDG_RUNTIME_DIR/wayland-0" ] && [ -e "$XDG_RUNTIME_DIR/pulse/native" ]; then exit 0; fi; sleep 1; i=$((i+1)); done; exit 1'
 ExecStart=/usr/bin/waydroid session start
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
-"@
+'@
+            $unit = $unit.TrimEnd() -replace '__UID__', $uid
+            $unitB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($unit))
             $scriptText = @"
 set -e
 install -d -m 755 -o '$user' -g '$user' '/home/$user/.config/systemd/user'
-cat > '/home/$user/.config/systemd/user/waydroid-session.service' <<'UNIT'
-$($unit.TrimEnd())
-UNIT
+echo '$unitB64' | base64 -d > '/home/$user/.config/systemd/user/waydroid-session.service'
 chown '$user':'$user' '/home/$user/.config/systemd/user/waydroid-session.service'
 loginctl enable-linger '$user'
 systemctl start 'user@$uid.service' 2>/dev/null || true
@@ -697,9 +779,9 @@ runuser -u '$user' -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user enable
             $uid = $session.Uid
             $user = $session.User
             $scriptText = @"
-systemctl start waydroid-container.service 2>/dev/null || true
+systemctl restart waydroid-container.service 2>/dev/null || systemctl start waydroid-container.service 2>/dev/null || true
 systemctl start 'user@$uid.service' 2>/dev/null || true
-runuser -u '$user' -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user start waydroid-session.service 2>/dev/null || true
+runuser -u '$user' -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user restart waydroid-session.service 2>/dev/null || true
 "@
             [void](Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture)
         }
@@ -724,29 +806,38 @@ runuser -u '$user' -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user start 
         if (-not (Find-Adb)) { [void](Install-Adb) }
         $serial = $script:AdbSerial
         $session = Get-SessionState $DistroName
+        if ($session.Session -eq 'RUNNING') {
+            try { Enable-WindowsAdbKey $DistroName; Write-Ok 'Ключ Windows-ADB авторизован' }
+            catch { Write-Warn $_.Exception.Message }
+        }
         $ipScript = "export XDG_RUNTIME_DIR=/run/user/$($session.Uid); export WAYLAND_DISPLAY=wayland-0; export DISPLAY=:0; waydroid status 2>/dev/null | sed -n 's/^IP address:[[:space:]]*//p'"
         $ipLine = Invoke-WslCapture @('-d', $DistroName, '--', 'bash', '-c', (ConvertTo-BashCommand $ipScript)) 60
         $ip = $ipLine.Out.Trim()
         if ($ip -and $ip -ne 'UNKNOWN') { $serial = "${ip}:5555" }
         $adb = Get-AdbState $serial
+        for ($i = 0; $i -lt 2 -and -not $adb.Online; $i++) {
+            Start-Sleep -Seconds 3
+            $adb = Get-AdbState $serial
+        }
         if ($adb.Online) {
             Write-Ok "ADB подключён: $serial"
             Save-ManagerConfig $DistroName $serial
         } else {
-            Write-Warn "ADB не ответил на $serial. Запустите приложение и подключитесь вручную."
+            Write-Warn "ADB пока не ответил на $serial."
+            Write-Info 'Он подключится автоматически при первом запуске приложения.'
             Save-ManagerConfig $DistroName $serial
         }
     }
 
     Write-Host ''
-    Write-Host 'Готово. Перезапустите Winndroid.' -ForegroundColor Green
+    Write-Host 'Готово. Перезапустите Winoid.' -ForegroundColor Green
     Show-Status $DistroName | Out-Null
 }
 
 function Show-Menu([string]$DistroName) {
     while ($true) {
         Write-Host ''
-        Write-Host 'Winndroid — настройка Android' -ForegroundColor White
+        Write-Host 'Winoid — настройка Android' -ForegroundColor White
         Write-Host '1  Проверить бэкенд'
         Write-Host '2  Настроить / восстановить'
         Write-Host '3  Открыть инструкцию в браузере'
@@ -768,7 +859,7 @@ function Show-Menu([string]$DistroName) {
 
 Write-Host ''
 Write-Host '========================================' -ForegroundColor DarkGray
-Write-Host ' Winndroid: настройка Android-бэкенда' -ForegroundColor White
+Write-Host ' Winoid: настройка Android-бэкенда' -ForegroundColor White
 Write-Host '========================================' -ForegroundColor DarkGray
 Write-Log "START mode=$Mode distro=$Distro yes=$Yes dryrun=$DryRun"
 

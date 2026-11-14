@@ -1,5 +1,5 @@
 param(
-    [string]$Out = (Join-Path $PSScriptRoot '..\assets\winndroid.ico')
+    [string]$Out = (Join-Path $PSScriptRoot '..\assets\winoid.ico')
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
