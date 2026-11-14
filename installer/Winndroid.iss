@@ -1,6 +1,6 @@
 #define MyAppName "Winndroid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.2"
+  #define MyAppVersion "0.1.3"
 #endif
 #define MyAppPublisher "Sergey35853"
 #define MyAppURL "https://github.com/Sergey35853/winndroid"
@@ -35,10 +35,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
 Name: "downloadadb"; Description: "Download Android platform-tools (adb)"; GroupDescription: "Components:"; Flags: checkedonce
+Name: "setupbackend"; Description: "Open Android backend setup after installation (experimental)"; GroupDescription: "Components:"; Flags: unchecked
 
 [Files]
 Source: "..\Winndroid.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Winndroid.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Setup-Backend.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.example.json"; DestDir: "{app}"; Flags: ignoreversion
@@ -52,6 +54,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Setup-ADB.ps1"""; StatusMsg: "Downloading Android platform-tools..."; Flags: runhidden waituntilterminated; Tasks: downloadadb
+Filename: "pwsh.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Setup-Backend.ps1"""; WorkingDir: "{app}"; Description: "Set up Android backend"; Flags: postinstall nowait skipifsilent; Tasks: setupbackend
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]

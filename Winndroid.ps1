@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
+$script:baseDir = $PSScriptRoot
 $script:instanceMutex = New-Object System.Threading.Mutex($false, 'Local\WinndroidManager')
 if (-not $script:instanceMutex.WaitOne(0)) {
     [System.Windows.MessageBox]::Show('Winndroid уже запущен.', 'Winndroid') | Out-Null
@@ -371,7 +372,7 @@ $mainXaml = @'
         <Button x:Name="LaunchBtn" Style="{StaticResource Primary}" Content="Запустить в отдельном окне" IsEnabled="False"/>
         <Button x:Name="FullUiBtn" Content="Открыть Android целиком"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
-        <Button x:Name="BackendBtn" Content="Как настроить Android" Visibility="Collapsed"/>
+        <Button x:Name="BackendBtn" Content="Настроить Android" Visibility="Collapsed"/>
         <Border Height="1" Background="#2A2C33" Margin="0,8,0,14"/>
         <TextBlock Text="Размер нового окна" FontSize="12" Foreground="#8D929C" Margin="2,0,0,6"/>
         <ComboBox x:Name="SizeBox" Background="#26282F" Foreground="#F1F3F5" BorderBrush="#34363E" Padding="8,6" Margin="0,0,0,12">
@@ -561,7 +562,7 @@ function Test-Session {
     if (-not (Test-Backend)) {
         Set-Status 'Бэкенд не настроен' '#E5484D'
         $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return $false
     }
     Set-Status 'Android остановлен' '#F5A623'
@@ -587,7 +588,7 @@ function Refresh-Apps {
         $script:apps = @()
         Update-AppFilter
         $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return
     }
     Set-Footer 'Чтение списка приложений…'
@@ -999,7 +1000,7 @@ function Start-AppLaunch($app) {
     if ($null -eq $app) { return }
     if (-not (Test-Backend)) {
         $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return
     }
     $existing = Find-WrapperByPackage $app.Package
@@ -1123,7 +1124,7 @@ $sessionTimer.Add_Tick({
 function Start-Session {
     if (-not (Test-Backend)) {
         $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return
     }
     $script:sessionTicks = 0
@@ -1164,8 +1165,15 @@ $installBtn.Add_Click({
     if ($dlg.ShowDialog($window) -eq $true) { Install-Apk $dlg.FileName }
 })
 $backendBtn.Add_Click({
-    Start-Process 'https://github.com/Sergey35853/winndroid/blob/main/README.md#как-поднять-бэкенд'
-    Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
+    $setup = Join-Path $script:baseDir 'Setup-Backend.ps1'
+    if (-not (Test-Path -LiteralPath $setup)) { $setup = Join-Path $script:baseDir 'installer\Setup-Backend.ps1' }
+    if (Test-Path -LiteralPath $setup) {
+        Start-Process -FilePath 'pwsh.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$setup`"" -WorkingDirectory $script:baseDir
+        Set-Footer 'Открыл настройку Android в отдельном окне.'
+    } else {
+        Start-Process 'https://github.com/Sergey35853/winndroid/blob/main/README.md#как-поднять-бэкенд'
+        Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
+    }
 })
 $fullUiBtn.Add_Click({
     if (-not $script:sessionRunning) {
