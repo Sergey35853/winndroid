@@ -1,0 +1,7 @@
+dist/
+stage/
+platform-tools/
+*.log
+config.json
+.vscode/
+Thumbs.db
