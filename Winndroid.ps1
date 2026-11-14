@@ -371,6 +371,7 @@ $mainXaml = @'
         <Button x:Name="LaunchBtn" Style="{StaticResource Primary}" Content="Запустить в отдельном окне" IsEnabled="False"/>
         <Button x:Name="FullUiBtn" Content="Открыть Android целиком"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
+        <Button x:Name="BackendBtn" Content="Как настроить Android" Visibility="Collapsed"/>
         <Border Height="1" Background="#2A2C33" Margin="0,8,0,14"/>
         <TextBlock Text="Размер нового окна" FontSize="12" Foreground="#8D929C" Margin="2,0,0,6"/>
         <ComboBox x:Name="SizeBox" Background="#26282F" Foreground="#F1F3F5" BorderBrush="#34363E" Padding="8,6" Margin="0,0,0,12">
@@ -473,6 +474,7 @@ $appsList      = $window.FindName('AppsList')
 $launchBtn     = $window.FindName('LaunchBtn')
 $fullUiBtn     = $window.FindName('FullUiBtn')
 $installBtn    = $window.FindName('InstallBtn')
+$backendBtn    = $window.FindName('BackendBtn')
 $sizeBox       = $window.FindName('SizeBox')
 $autoHideCheck = $window.FindName('AutoHideCheck')
 $footerText    = $window.FindName('FooterText')
@@ -542,14 +544,29 @@ function Get-WaydroidStatus {
     return 'STOPPED'
 }
 
+function Test-Backend {
+    $cmd = 'command -v waydroid >/dev/null 2>&1 && echo WINNDROID_BACKEND_OK'
+    $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 10000
+    return ($r.Out -match 'WINNDROID_BACKEND_OK')
+}
+
 function Test-Session {
-    $script:sessionRunning = ((Get-WaydroidStatus) -eq 'RUNNING')
-    if ($script:sessionRunning) {
+    if ((Get-WaydroidStatus) -eq 'RUNNING') {
+        $script:sessionRunning = $true
         Set-Status 'Android работает' '#3DDC84'
-    } else {
-        Set-Status 'Android остановлен' '#F5A623'
+        $backendBtn.Visibility = 'Collapsed'
+        return $true
     }
-    return $script:sessionRunning
+    $script:sessionRunning = $false
+    if (-not (Test-Backend)) {
+        Set-Status 'Бэкенд не настроен' '#E5484D'
+        $backendBtn.Visibility = 'Visible'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        return $false
+    }
+    Set-Status 'Android остановлен' '#F5A623'
+    $backendBtn.Visibility = 'Collapsed'
+    return $false
 }
 
 function Update-AppFilter {
@@ -566,6 +583,13 @@ function Update-AppFilter {
 }
 
 function Refresh-Apps {
+    if (-not (Test-Backend)) {
+        $script:apps = @()
+        Update-AppFilter
+        $backendBtn.Visibility = 'Visible'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        return
+    }
     Set-Footer 'Чтение списка приложений…'
     $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid app list'
     $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 30000
@@ -966,6 +990,11 @@ $launchTimer.Add_Tick({
 
 function Start-AppLaunch($app) {
     if ($null -eq $app) { return }
+    if (-not (Test-Backend)) {
+        $backendBtn.Visibility = 'Visible'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        return
+    }
     $existing = Find-WrapperByPackage $app.Package
     if ($null -ne $existing) {
         Focus-Wrapper $existing
@@ -1085,6 +1114,11 @@ $sessionTimer.Add_Tick({
 })
 
 function Start-Session {
+    if (-not (Test-Backend)) {
+        $backendBtn.Visibility = 'Visible'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Как настроить Android» или откройте README.'
+        return
+    }
     $script:sessionTicks = 0
     $script:sessionWaiting = $false
     $loaderTitle.Text = 'Запуск Android'
@@ -1121,6 +1155,10 @@ $installBtn.Add_Click({
     $dlg.Title = 'Выберите APK'
     $dlg.Filter = 'Android package (*.apk)|*.apk|Все файлы (*.*)|*.*'
     if ($dlg.ShowDialog($window) -eq $true) { Install-Apk $dlg.FileName }
+})
+$backendBtn.Add_Click({
+    Start-Process 'https://github.com/Sergey35853/winndroid/blob/main/README.md#как-поднять-бэкенд'
+    Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
 })
 $fullUiBtn.Add_Click({
     if (-not $script:sessionRunning) {
