@@ -912,15 +912,22 @@ $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(40)
 $script:frameTimer.Add_Tick({
     try {
         $list = $script:wrappers
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
         for ($i = $list.Count - 1; $i -ge 0; $i--) {
             if ($i -ge $list.Count) { continue }
             $w = $list[$i]
             if ($w.Closed) { continue }
             if (-not [NativeWin]::IsWindow($w.Source)) { Remove-Wrapper $w $false; continue }
-            if (-not $w.Window.IsVisible -or $w.Window.WindowState -eq 'Minimized') { continue }
             if ([NativeWin]::IsIconic($w.Source)) {
                 [void][NativeWin]::ShowWindow($w.Source, 9)
             }
+            $sr = New-Object NativeWin+RECT
+            [void][NativeWin]::GetWindowRect($w.Source, [ref]$sr)
+            if ($sr.Left -lt $wa.Right -and $sr.Right -gt $wa.Left -and $sr.Top -lt $wa.Bottom -and $sr.Bottom -gt $wa.Top) {
+                if ([NativeWin]::IsZoomed($w.Source)) { [void][NativeWin]::ShowWindow($w.Source, 9) }
+                [void][NativeWin]::SetWindowPos($w.Source, [IntPtr]::Zero, 3000, 0, $w.SrcW, $w.SrcH, 0x0010)
+            }
+            if (-not $w.Window.IsVisible -or $w.Window.WindowState -eq 'Minimized') { continue }
             [void]$w.Grab.Capture($w.Source)
             $w.Wb.WritePixels($w.Rect, $w.Grab.Bits, $w.Grab.ByteSize, $w.Grab.Stride)
             $w.Frames++
