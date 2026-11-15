@@ -1,6 +1,6 @@
 #define MyAppName "Winoid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.4"
+  #define MyAppVersion "0.1.5"
 #endif
 #define MyAppPublisher "Sergey35853"
 #define MyAppURL "https://github.com/Sergey35853/winoid"
@@ -20,13 +20,13 @@ DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE
 OutputDir=..\dist
 OutputBaseFilename=Winoid-Setup-{#MyAppVersion}
-SetupIconFile=..\assets\winoid.ico
+SetupIconFile=..\assets\android.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}\assets\winoid.ico
+UninstallDisplayIcon={app}\assets\android.ico
 MinVersion=10.0.19041
 
 [Languages]
@@ -44,13 +44,15 @@ Source: "..\Setup-Backend.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.example.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\assets\winoid.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\assets\android.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\assets\winoid-icon.dex"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\assets\iconjob.ps1"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\docs\screenshot-manager.png"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "Setup-ADB.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winoid.ico"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\winoid.ico"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\android.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\android.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Setup-ADB.ps1"""; StatusMsg: "Downloading Android platform-tools..."; Flags: runhidden waituntilterminated; Tasks: downloadadb

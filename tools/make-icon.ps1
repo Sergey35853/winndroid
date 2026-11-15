@@ -1,5 +1,6 @@
 param(
-    [string]$Out = (Join-Path $PSScriptRoot '..\assets\winoid.ico')
+    [string]$Out = (Join-Path $PSScriptRoot '..\assets\android.ico'),
+    [string]$Preview = ''
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -7,6 +8,8 @@ Add-Type -AssemblyName System.Drawing
 function New-RoundedRect([float]$w, [float]$h, [float]$r) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
     $d = $r * 2
+    if ($d -gt $w) { $d = $w }
+    if ($d -gt $h) { $d = $h }
     $p.AddArc(0, 0, $d, $d, 180, 90)
     $p.AddArc($w - $d, 0, $d, $d, 270, 90)
     $p.AddArc($w - $d, $h - $d, $d, $d, 0, 90)
@@ -15,38 +18,125 @@ function New-RoundedRect([float]$w, [float]$h, [float]$r) {
     return $p
 }
 
-$sizes = @(16, 24, 32, 48, 64, 128, 256)
-$pngs = @()
-foreach ($s in $sizes) {
+function New-IconBitmap([int]$s) {
     $bmp = New-Object System.Drawing.Bitmap $s, $s, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
-    $pad = [Math]::Max(1, [int]($s * 0.04))
-    $rect = New-Object System.Drawing.RectangleF $pad, $pad, ($s - 2 * $pad), ($s - 2 * $pad)
-    $path = New-RoundedRect $rect.Width $rect.Height ([Math]::Max(2, $s * 0.22))
-    $m = New-Object System.Drawing.Drawing2D.Matrix
-    $m.Translate($rect.X, $rect.Y)
-    $path.Transform($m)
-    $m.Dispose()
-    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush $rect, ([System.Drawing.Color]::FromArgb(255, 61, 126, 255)), ([System.Drawing.Color]::FromArgb(255, 47, 107, 234)), 45.0
-    $g.FillPath($brush, $path)
-    $font = New-Object System.Drawing.Font 'Segoe UI', ([Math]::Max(7, $s * 0.56)), ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
-    $sf = New-Object System.Drawing.StringFormat
-    $sf.Alignment = [System.Drawing.StringAlignment]::Center
-    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $g.DrawString('W', $font, [System.Drawing.Brushes]::White, $rect, $sf)
+
+    # four squares, like the Windows Start button
+    $m = $s * 0.055
+    $gap = $s * 0.045
+    $q = ($s - 2 * $m - $gap) / 2
+    $r = [Math]::Max(1.0, $q * 0.14)
+    $colors = @(
+        [System.Drawing.Color]::FromArgb(255, 76, 154, 255),
+        [System.Drawing.Color]::FromArgb(255, 61, 126, 255),
+        [System.Drawing.Color]::FromArgb(255, 47, 107, 234),
+        [System.Drawing.Color]::FromArgb(255, 36, 87, 197)
+    )
+    $positions = @(
+        [pscustomobject]@{ X = $m; Y = $m },
+        [pscustomobject]@{ X = ($m + $q + $gap); Y = $m },
+        [pscustomobject]@{ X = $m; Y = ($m + $q + $gap) },
+        [pscustomobject]@{ X = ($m + $q + $gap); Y = ($m + $q + $gap) }
+    )
+    for ($i = 0; $i -lt 4; $i++) {
+        $path = New-RoundedRect $q $q $r
+        $mt = New-Object System.Drawing.Drawing2D.Matrix
+        $mt.Translate([float]$positions[$i].X, [float]$positions[$i].Y)
+        $path.Transform($mt)
+        $mt.Dispose()
+        $brush = New-Object System.Drawing.SolidBrush $colors[$i]
+        $g.FillPath($brush, $path)
+        $brush.Dispose()
+        $path.Dispose()
+    }
+
+    # android robot in front
+    $white = [System.Drawing.Brushes]::White
+    $dark = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 23, 58, 107))
+
+    $head = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $hr = New-Object System.Drawing.RectangleF ($s * 0.28), ($s * 0.22), ($s * 0.44), ($s * 0.44)
+    $head.AddArc($hr, 180, 180)
+    $head.CloseFigure()
+    $g.FillPath($white, $head)
+
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), ([Math]::Max(1.0, $s * 0.028))
+    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $g.DrawLine($pen, ($s * 0.35), ($s * 0.25), ($s * 0.30), ($s * 0.16))
+    $g.DrawLine($pen, ($s * 0.65), ($s * 0.25), ($s * 0.70), ($s * 0.16))
+
+    if ($s -ge 24) {
+        $eye = [Math]::Max(0.8, $s * 0.021)
+        $g.FillEllipse($dark, ($s * 0.39 - $eye), ($s * 0.35 - $eye), ($eye * 2), ($eye * 2))
+        $g.FillEllipse($dark, ($s * 0.61 - $eye), ($s * 0.35 - $eye), ($eye * 2), ($eye * 2))
+    }
+
+    $body = New-RoundedRect ($s * 0.34) ($s * 0.17) ([Math]::Max(1.5, $s * 0.035))
+    $mt = New-Object System.Drawing.Drawing2D.Matrix
+    $mt.Translate($s * 0.33, $s * 0.50)
+    $body.Transform($mt)
+    $mt.Dispose()
+    $g.FillPath($white, $body)
+
+    $armL = New-RoundedRect ($s * 0.07) ($s * 0.14) ([Math]::Max(1.5, $s * 0.034))
+    $mt = New-Object System.Drawing.Drawing2D.Matrix
+    $mt.Translate($s * 0.23, $s * 0.49)
+    $armL.Transform($mt)
+    $mt.Dispose()
+    $g.FillPath($white, $armL)
+
+    $armR = New-RoundedRect ($s * 0.07) ($s * 0.14) ([Math]::Max(1.5, $s * 0.034))
+    $mt = New-Object System.Drawing.Drawing2D.Matrix
+    $mt.Translate($s * 0.70, $s * 0.49)
+    $armR.Transform($mt)
+    $mt.Dispose()
+    $g.FillPath($white, $armR)
+
+    $legL = New-RoundedRect ($s * 0.07) ($s * 0.12) ([Math]::Max(1.5, $s * 0.034))
+    $mt = New-Object System.Drawing.Drawing2D.Matrix
+    $mt.Translate($s * 0.37, $s * 0.69)
+    $legL.Transform($mt)
+    $mt.Dispose()
+    $g.FillPath($white, $legL)
+
+    $legR = New-RoundedRect ($s * 0.07) ($s * 0.12) ([Math]::Max(1.5, $s * 0.034))
+    $mt = New-Object System.Drawing.Drawing2D.Matrix
+    $mt.Translate($s * 0.56, $s * 0.69)
+    $legR.Transform($mt)
+    $mt.Dispose()
+    $g.FillPath($white, $legR)
+
+    $pen.Dispose(); $head.Dispose(); $body.Dispose()
+    $armL.Dispose(); $armR.Dispose(); $legL.Dispose(); $legR.Dispose(); $dark.Dispose(); $g.Dispose()
+    return $bmp
+}
+
+if ($Preview) {
+    $b = New-IconBitmap 256
+    $b.Save($Preview, [System.Drawing.Imaging.ImageFormat]::Png)
+    $b.Dispose()
+    "preview: $Preview"
+}
+
+$sizes = @(16, 24, 32, 48, 64, 128, 256)
+$pngs = @()
+foreach ($s in $sizes) {
+    $bmp = New-IconBitmap $s
     $ms = New-Object System.IO.MemoryStream
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $pngs += ,$ms.ToArray()
-    $ms.Dispose(); $font.Dispose(); $brush.Dispose(); $path.Dispose(); $g.Dispose(); $bmp.Dispose()
+    $ms.Dispose(); $bmp.Dispose()
 }
 
 $ms = New-Object System.IO.MemoryStream
 $bw = New-Object System.IO.BinaryWriter $ms
-$bw.Write([UInt16]0)      # reserved
-$bw.Write([UInt16]1)      # type: icon
+$bw.Write([UInt16]0)
+$bw.Write([UInt16]1)
 $bw.Write([UInt16]$sizes.Count)
 $offset = 6 + 16 * $sizes.Count
 for ($i = 0; $i -lt $sizes.Count; $i++) {

@@ -9,22 +9,53 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 public class WinoidActivate {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
 }
+public class WinoidDrive {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "DefineDosDeviceW")]
+    public static extern bool DefineDosDevice(uint flags, string name, string target);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "QueryDosDeviceW")]
+    public static extern uint QueryDosDevice(string name, StringBuilder target, uint max);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern void SHChangeNotify(int eventId, uint flags, string item1, string item2);
+}
 "@
 
 $script:baseDir = $PSScriptRoot
+$script:requestDir = Join-Path $env:LOCALAPPDATA 'Winoid\queue'
 $script:instanceMutex = New-Object System.Threading.Mutex($false, 'Local\WinoidManager')
 if (-not $script:instanceMutex.WaitOne(0)) {
+    $queued = $false
+    if ($Launch -or $Install) {
+        try {
+            if (-not (Test-Path -LiteralPath $script:requestDir)) {
+                New-Item -ItemType Directory -Path $script:requestDir -Force | Out-Null
+            }
+            $action = 'launch'
+            $target = $Launch
+            if (-not $Launch) { $action = 'install'; $target = $Install }
+            $req = [ordered]@{
+                action  = $action
+                target  = $target
+                created = (Get-Date).ToString('o')
+            } | ConvertTo-Json -Compress
+            $name = 'req-{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+            $tmp = Join-Path $script:requestDir ($name + '.tmp')
+            [System.IO.File]::WriteAllText($tmp, $req, (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $tmp -Destination (Join-Path $script:requestDir $name) -ErrorAction Stop
+            $queued = $true
+        } catch { }
+    }
     $existing = [WinoidActivate]::FindWindow($null, 'Winoid')
     if ($existing -ne [IntPtr]::Zero) {
         [void][WinoidActivate]::ShowWindow($existing, 9)
         [void][WinoidActivate]::SetForegroundWindow($existing)
-    } else {
+    } elseif (-not $queued) {
         [System.Windows.MessageBox]::Show('Winoid уже запущен.', 'Winoid') | Out-Null
     }
     exit
@@ -160,13 +191,16 @@ public class AdbShell : IDisposable {
     Process _p;
     BlockingCollection<string> _lines = new BlockingCollection<string>();
 
-    public AdbShell(string adb, string serial) {
+    public AdbShell(string adb, string serial) : this(adb, serial, new string[0]) { }
+
+    public AdbShell(string adb, string serial, string[] prefixArgs) {
         var psi = new ProcessStartInfo(adb);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.RedirectStandardInput = true;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
+        foreach (var a in prefixArgs) { psi.ArgumentList.Add(a); }
         psi.ArgumentList.Add("-s");
         psi.ArgumentList.Add(serial);
         psi.ArgumentList.Add("shell");
@@ -211,12 +245,14 @@ $script:wsl = "$env:SystemRoot\System32\wsl.exe"
 $script:sessionRunning = $false
 $script:apps = @()
 $script:launchState = $null
+$script:pendingAndroidWindow = $null
 $script:installJob = $null
 $script:installTicks = 0
 $script:sessionJob = $null
 $script:sessionTicks = 0
 $script:sessionWaiting = $false
 $script:wslKeepAlive = $null
+$script:msrdcId = 0
 
 $script:wrappers = New-Object System.Collections.ArrayList
 $script:wrapByImage = @{}
@@ -224,9 +260,16 @@ $script:wrapByWindow = @{}
 $script:bounceWrap = $null
 $script:adb = $null
 $script:adbPath = $null
+$script:adbNextTry = [DateTime]::MinValue
 $script:adbSerial = '192.168.240.112:5555'
 $script:adbCheckedAt = [DateTime]::MinValue
 $script:wslDistro = ''
+$script:wslHome = ''
+$script:wslUser = ''
+$script:androidDrive = ''
+$script:androidDriveTarget = ''
+$script:androidDriveMode = ''
+$script:androidDriveAclDone = $false
 
 # One-time migration from the old Winndroid data directory.
 function Initialize-WinoidData {
@@ -358,6 +401,29 @@ $mainXaml = @'
         </Setter.Value>
       </Setter>
     </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="#26282F"/>
+      <Setter Property="Foreground" Value="#F1F3F5"/>
+      <Setter Property="BorderBrush" Value="#34363E"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="8,6"/>
+    </Style>
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Foreground" Value="#F1F3F5"/>
+      <Setter Property="Background" Value="#26282F"/>
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Style.Triggers>
+        <Trigger Property="IsHighlighted" Value="True">
+          <Setter Property="Background" Value="#3D7EFF"/>
+          <Setter Property="Foreground" Value="White"/>
+        </Trigger>
+        <Trigger Property="IsSelected" Value="True">
+          <Setter Property="Background" Value="#25314D"/>
+          <Setter Property="Foreground" Value="#F1F3F5"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
   </Window.Resources>
 
   <Grid Margin="20">
@@ -416,7 +482,7 @@ $mainXaml = @'
                   </Border>
                   <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center">
                     <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                    <TextBlock Text="{Binding Package}" FontSize="11" Foreground="#7F8590" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding Package}" FontSize="11" Foreground="#A9AEBA" TextTrimming="CharacterEllipsis"/>
                   </StackPanel>
                   <TextBlock Grid.Column="2" Text="↗" FontSize="16" Foreground="#5E6470" VerticalAlignment="Center" Margin="8,0,4,0"/>
                 </Grid>
@@ -428,7 +494,10 @@ $mainXaml = @'
 
       <StackPanel Grid.Column="1" Margin="16,0,0,0">
         <Button x:Name="LaunchBtn" Style="{StaticResource Primary}" Content="Запустить в отдельном окне" IsEnabled="False"/>
-        <Button x:Name="FullUiBtn" Content="Открыть Android целиком"/>
+        <Button x:Name="ShortcutBtn" Content="Ярлык на рабочем столе" IsEnabled="False"/>
+        <Button x:Name="DriveBtn" Content="Открыть диск Android"/>
+        <Button x:Name="FullUiBtn" Content="Перезапустить Android"/>
+        <Button x:Name="SettingsBtn" Content="Настройки Android"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
         <Button x:Name="BackendBtn" Content="Настроить Android" Visibility="Collapsed"/>
         <Border Height="1" Background="#2A2C33" Margin="0,8,0,14"/>
@@ -440,12 +509,12 @@ $mainXaml = @'
           <ComboBoxItem Content="1920 × 1080"/>
         </ComboBox>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
-        <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#7F8590"
-                   Text="Перетащите APK в окно, чтобы установить. Двойной клик по приложению запускает его в отдельном окне. Окна можно сворачивать, разворачивать и менять их размер обычными средствами Windows."/>
+        <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
+                   Text="Перетащите APK в окно, чтобы установить. Двойной клик по приложению запускает его в отдельном окне. Кнопка «Ярлык на рабочем столе» создаёт ярлык с родной иконкой приложения. «Настройки Android» открывает системные настройки, «Диск Android» — общую память Android в проводнике, «Перезапустить Android» возвращает окна, если графика WSL зависла. Окно Winoid можно открыть ярлыком на рабочем столе, в меню Пуск или файлом Winoid.cmd."/>
       </StackPanel>
     </Grid>
 
-    <TextBlock x:Name="FooterText" Grid.Row="2" Margin="2,14,0,0" FontSize="12" Foreground="#7F8590" Text="Готово"/>
+    <TextBlock x:Name="FooterText" Grid.Row="2" Margin="2,14,0,0" FontSize="12" Foreground="#A9AEBA" Text="Готово"/>
   </Grid>
 </Window>
 '@
@@ -516,7 +585,7 @@ $window = [System.Windows.Markup.XamlReader]::Parse($mainXaml)
 $loader = [System.Windows.Markup.XamlReader]::Parse($loaderXaml)
 
 $script:appIcon = $null
-$iconPath = Join-Path $PSScriptRoot 'assets\winoid.ico'
+$iconPath = Join-Path $PSScriptRoot 'assets\android.ico'
 if (Test-Path -LiteralPath $iconPath) {
     try {
         $script:appIcon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconPath))
@@ -531,7 +600,10 @@ $searchBox     = $window.FindName('SearchBox')
 $refreshBtn    = $window.FindName('RefreshBtn')
 $appsList      = $window.FindName('AppsList')
 $launchBtn     = $window.FindName('LaunchBtn')
+$shortcutBtn   = $window.FindName('ShortcutBtn')
+$driveBtn      = $window.FindName('DriveBtn')
 $fullUiBtn     = $window.FindName('FullUiBtn')
+$settingsBtn   = $window.FindName('SettingsBtn')
 $installBtn    = $window.FindName('InstallBtn')
 $backendBtn    = $window.FindName('BackendBtn')
 $sizeBox       = $window.FindName('SizeBox')
@@ -585,6 +657,208 @@ function Invoke-Wsl {
         return [pscustomobject]@{ Out = ''; Err = 'timeout'; Code = -1 }
     }
     return [pscustomobject]@{ Out = $outTask.Result; Err = $errTask.Result; Code = $p.ExitCode }
+}
+
+function Get-WslDistroName {
+    if (-not [string]::IsNullOrWhiteSpace($script:wslDistro)) { return $script:wslDistro }
+    try {
+        $out = & $script:wsl -l -q 2>$null
+        $text = ($out | Out-String) -replace "`0", ''
+        $name = @($text -split "`r?`n" | Where-Object { $_.Trim() })[0]
+        if ($name) { $script:wslDistro = $name.Trim() }
+    } catch { }
+    return $script:wslDistro
+}
+
+function Get-WslUserName {
+    if (-not [string]::IsNullOrWhiteSpace($script:wslUser)) { return $script:wslUser }
+    $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'id -un')) 12000
+    if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
+        $script:wslUser = $r.Out.Trim()
+    }
+    return $script:wslUser
+}
+
+function Get-WslHome {
+    if (-not [string]::IsNullOrWhiteSpace($script:wslHome)) { return $script:wslHome }
+    $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'printf %s "$HOME"')) 12000
+    if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
+        $script:wslHome = $r.Out.Trim()
+    }
+    return $script:wslHome
+}
+
+# Waydroid keeps its Android images and /sdcard in the session user's home.
+# The files are owned by Android's media_rw (1023), so grant the WSL user an
+# ACL instead of changing ownership (Android still sees its normal uids).
+function Get-AndroidStorageInfo {
+    param([switch]$ApplyAcl)
+    $linuxHome = Get-WslHome
+    if ([string]::IsNullOrWhiteSpace($linuxHome)) { return $null }
+
+    # Keep the shell command free of variables: WSL's -lc argument handling
+    # strips $name expansions when the script is passed through CreateProcess.
+    $storage = ''
+    foreach ($candidate in @("$linuxHome/.local/share/waydroid/data/media/0", '/var/lib/waydroid/data/media/0')) {
+        $cmd = "test -d '$candidate' && printf %s '$candidate'"
+        $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'bash', '-lc', $cmd)) 15000
+        if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
+            $storage = $r.Out.Trim()
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($storage)) { return $null }
+
+    if ($ApplyAcl) {
+        $user = Get-WslUserName
+        if ([string]::IsNullOrWhiteSpace($user)) { $user = 'winoid' }
+        $cmd = "if command -v setfacl >/dev/null 2>&1; then setfacl -R -m u:$user:rwx '$storage' 2>/dev/null; setfacl -R -d -m u:$user:rwx '$storage' 2>/dev/null; else chmod -R o+rwX '$storage' 2>/dev/null; fi; printf %s '$storage'"
+        $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'bash', '-lc', $cmd)) 120000
+        if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
+            return $r.Out.Trim()
+        }
+    }
+    return $storage
+}
+
+function Get-FreeDriveLetter {
+    try {
+        $used = @{}
+        foreach ($d in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            $used[$d.Name] = $true
+        }
+        foreach ($letter in @('W', 'V', 'X', 'Y', 'Z', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M', 'L', 'K', 'J', 'I', 'H', 'G', 'F')) {
+            if ($used.ContainsKey($letter)) { continue }
+            $sb = New-Object System.Text.StringBuilder 1024
+            if ([WinoidDrive]::QueryDosDevice("${letter}:", $sb, 1024) -ne 0) { continue }
+            if (Test-Path -LiteralPath "${letter}:\") { continue }
+            return $letter
+        }
+    } catch { }
+    return $null
+}
+
+function Set-DriveAppearance([string]$Letter) {
+    try {
+        $base = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\$Letter"
+        New-Item -Path "$base\DefaultLabel" -Force | Out-Null
+        Set-Item -Path "$base\DefaultLabel" -Value 'Android'
+        $icon = Join-Path $script:baseDir 'assets\android.ico'
+        if (Test-Path -LiteralPath $icon) {
+            New-Item -Path "$base\DefaultIcon" -Force | Out-Null
+            Set-Item -Path "$base\DefaultIcon" -Value $icon
+        }
+    } catch { }
+}
+
+# A drive can have a stack of DOS-device mappings. P9Rdr targets need
+# DDD_RAW_TARGET_PATH, ordinary UNC targets do not.
+function Remove-DriveMapping([string]$Letter) {
+    for ($i = 0; $i -lt 12; $i++) {
+        $sb = New-Object System.Text.StringBuilder 1024
+        $n = [WinoidDrive]::QueryDosDevice("${Letter}:", $sb, 1024)
+        if ($n -eq 0) { break }
+        $target = $sb.ToString()
+        $flags = if ($target.StartsWith('\Device\')) { 7 } else { 6 }
+        if (-not [WinoidDrive]::DefineDosDevice($flags, "${Letter}:", $target)) { break }
+    }
+    try { & net.exe use "${Letter}:" /delete /y 2>&1 | Out-Null } catch { }
+}
+
+function Mount-AndroidDrive {
+    param([switch]$Open)
+    if (-not [string]::IsNullOrWhiteSpace($script:androidDrive) -and (Test-Path -LiteralPath "${script:androidDrive}\")) {
+        if ($Open) { Start-Process -FilePath 'explorer.exe' -ArgumentList "${script:androidDrive}\" }
+        return $true
+    }
+
+    $storage = Get-AndroidStorageInfo -ApplyAcl:(-not $script:androidDriveAclDone)
+    if ([string]::IsNullOrWhiteSpace($storage)) {
+        Set-Footer 'Не нашёл хранилище Android в WSL.'
+        return $false
+    }
+    $script:androidDriveAclDone = $true
+
+    $distro = Get-WslDistroName
+    if ([string]::IsNullOrWhiteSpace($distro)) {
+        Set-Footer 'Не удалось определить дистрибутив WSL.'
+        return $false
+    }
+    $uncRoot = "\\wsl.localhost\$distro"
+    if (-not (Test-Path -LiteralPath $uncRoot)) {
+        $uncRoot = "\\wsl`$\$distro"
+    }
+    if (-not (Test-Path -LiteralPath $uncRoot)) {
+        Set-Footer "WSL-дистрибутив $distro недоступен."
+        return $false
+    }
+
+    $letter = Get-FreeDriveLetter
+    if ([string]::IsNullOrWhiteSpace($letter)) {
+        Set-Footer 'Нет свободной буквы диска для Android.'
+        return $false
+    }
+
+    Set-DriveAppearance $letter
+    Set-Footer 'Подключаю диск Android…'
+    $target = ''
+    $mode = ''
+    $ok = $false
+
+    # Connect the WSL share to the letter, then point the letter at /sdcard
+    # through the same Plan 9 device. This keeps Explorer seeing a connected
+    # network drive rather than a disconnected UNC mapping.
+    try { & net.exe use "${letter}:" $uncRoot /persistent:no 2>&1 | Out-Null } catch { }
+    if ($LASTEXITCODE -eq 0) {
+        $sb = New-Object System.Text.StringBuilder 1024
+        if ([WinoidDrive]::QueryDosDevice("${letter}:", $sb, 1024) -gt 0) {
+            $base = $sb.ToString()
+            if ($base.StartsWith('\Device\P9Rdr\')) {
+                $target = $base + ($storage -replace '/', '\')
+                if ([WinoidDrive]::DefineDosDevice(9, "${letter}:", $target)) {
+                    $ok = $true
+                    $mode = 'p9'
+                }
+            }
+        }
+    }
+
+    if (-not $ok) {
+        try { & net.exe use "${letter}:" /delete /y 2>&1 | Out-Null } catch { }
+        $target = $uncRoot + ($storage -replace '/', '\')
+        if ([WinoidDrive]::DefineDosDevice(8, "${letter}:", $target)) {
+            $ok = $true
+            $mode = 'unc'
+        }
+    }
+
+    if (-not $ok) {
+        Remove-Item -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\$letter" -Recurse -Force -ErrorAction SilentlyContinue
+        Set-Footer 'Не удалось подключить диск Android.'
+        return $false
+    }
+
+    $script:androidDrive = "${letter}:"
+    $script:androidDriveTarget = $target
+    $script:androidDriveMode = $mode
+    try {
+        [WinoidDrive]::SHChangeNotify(0x100, 0x5, "${letter}:\", $null)
+        [WinoidDrive]::SHChangeNotify(0x2000, 0x5, "${letter}:\", $null)
+    } catch { }
+    Set-Footer "Диск Android подключён: ${letter}:"
+    if ($Open) { Start-Process -FilePath 'explorer.exe' -ArgumentList "${letter}:\" }
+    return $true
+}
+
+function Disconnect-AndroidDrive {
+    if ([string]::IsNullOrWhiteSpace($script:androidDrive)) { return }
+    $letter = $script:androidDrive.TrimEnd(':')
+    try { Remove-DriveMapping $letter } catch { }
+    try { [WinoidDrive]::SHChangeNotify(0x80, 0x5, "${letter}:\", $null) } catch { }
+    Remove-Item -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\$letter" -Recurse -Force -ErrorAction SilentlyContinue
+    $script:androidDrive = ''
+    $script:androidDriveTarget = ''
+    $script:androidDriveMode = ''
 }
 
 function Start-WslDetached {
@@ -655,6 +929,52 @@ function Update-AppFilter {
     $appsList.ItemsSource = $view
     if ($view.Count -gt 0) { $appsList.SelectedIndex = 0 }
     $launchBtn.IsEnabled = ($view.Count -gt 0)
+    $shortcutBtn.IsEnabled = ($view.Count -gt 0)
+}
+
+function Get-LauncherApps {
+    $dex = Join-Path $script:baseDir 'assets\winoid-icon.dex'
+    if (-not (Test-Path -LiteralPath $dex)) { return @() }
+    $remoteDex = '/data/local/tmp/winoid-icon.dex'
+    $linuxDex = ConvertTo-WslPath $dex
+    $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon --list"
+    $out = ''
+
+    # WSL adb reaches the Waydroid container even when a Windows VPN
+    # swallows the route to 192.168.240.0/24.
+    try {
+        $stateArgs = (Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'get-state')
+        $r = Invoke-Wsl $stateArgs 10000
+        if ($r.Out -notmatch 'device') {
+            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', 'connect', $script:adbSerial)) 10000
+            $r = Invoke-Wsl $stateArgs 10000
+        }
+        if ($r.Out -match 'device') {
+            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) 15000
+            $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 20000
+            if ($res.Out) { $out = $res.Out }
+        }
+    } catch { }
+
+    if (-not $out -and $script:adbPath) {
+        try {
+            $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 15000
+            $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 20000
+            if ($res) { $out = $res }
+        } catch { }
+    }
+
+    $byPackage = @{}
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match '^([^\t]+)\t(\S+)$') {
+            $name = $matches[1].Trim()
+            $pkg = $matches[2].Trim()
+            if (-not $byPackage.ContainsKey($pkg)) {
+                $byPackage[$pkg] = [pscustomobject]@{ Name = $name; Package = $pkg }
+            }
+        }
+    }
+    return @($byPackage.Values | Sort-Object Name)
 }
 
 function Refresh-Apps {
@@ -666,25 +986,31 @@ function Refresh-Apps {
         return
     }
     Set-Footer 'Чтение списка приложений…'
-    $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid app list'
-    $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 30000
-    if ($r.Code -ne 0 -or [string]::IsNullOrWhiteSpace($r.Out)) {
-        $script:apps = @()
+
+    $script:apps = @(Get-LauncherApps)
+    if ($script:apps.Count -eq 0) {
+        # Fallback for an older helper build or a failed app_process run.
+        $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid app list'
+        $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 30000
+        if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
+            $list = New-Object System.Collections.ArrayList
+            $blocks = ($r.Out -split '(?m)^Name:\s*') | Select-Object -Skip 1
+            foreach ($b in $blocks) {
+                $name = (($b -split "`r?`n")[0]).Trim()
+                if ($b -notmatch 'packageName:\s*(\S+)') { continue }
+                $pkg = $matches[1].Trim()
+                if ($b -notmatch 'android\.intent\.category\.LAUNCHER') { continue }
+                [void]$list.Add([pscustomobject]@{ Name = $name; Package = $pkg })
+            }
+            $script:apps = @($list | Sort-Object Name)
+        }
+    }
+
+    if ($script:apps.Count -eq 0) {
         Update-AppFilter
-        $msg = ($r.Err -replace '\s+', ' ').Trim()
-        if ($msg.Length -gt 0) { Set-Footer "Список недоступен: $msg" } else { Set-Footer 'Список пуст. Android ещё запускается?' }
+        Set-Footer 'Список пуст. Android ещё запускается? Нажмите «Обновить».'
         return
     }
-    $list = New-Object System.Collections.ArrayList
-    $blocks = ($r.Out -split '(?m)^Name:\s*') | Select-Object -Skip 1
-    foreach ($b in $blocks) {
-        $name = (($b -split "`r?`n")[0]).Trim()
-        if ($b -notmatch 'packageName:\s*(\S+)') { continue }
-        $pkg = $matches[1].Trim()
-        if ($b -notmatch 'android\.intent\.category\.LAUNCHER') { continue }
-        [void]$list.Add([pscustomobject]@{ Name = $name; Package = $pkg })
-    }
-    $script:apps = @($list | Sort-Object Name)
     Update-AppFilter
     Set-Footer "Приложений: $($script:apps.Count)"
 }
@@ -727,17 +1053,41 @@ function Invoke-AdbCli {
     $p = [System.Diagnostics.Process]::Start($psi)
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($TimeoutMs)) { try { $p.Kill() } catch { } }
+    if (-not $p.WaitForExit($TimeoutMs)) {
+        try { $p.Kill($true) } catch { try { $p.Kill() } catch { } }
+        try { [void]$p.WaitForExit(2000) } catch { }
+    }
+    # Never touch Result on a process that survived Kill: adb connect can
+    # hang on a VPN-blackholed route and would freeze the UI thread.
+    if (-not $p.HasExited) { return '' }
     return (($outTask.Result + ' ' + $errTask.Result) -replace '\s+', ' ').Trim()
 }
 
 function Initialize-Adb {
     if ($script:adb -and $script:adb.Running) { return }
     if (-not $script:adbPath) { $script:adbPath = Find-AdbExe }
+
+    # Prefer the WSL-side adb server: it sees the Waydroid container even
+    # when a Windows VPN blackholes 192.168.240.0/24.
+    $r = $null
+    try {
+        $r = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'get-state')) 8000
+    } catch { }
+    if ($r -and $r.Out -match 'device') {
+        $prefix = New-Object System.Collections.ArrayList
+        if (-not [string]::IsNullOrWhiteSpace($script:wslDistro)) { [void]$prefix.Add('-d'); [void]$prefix.Add($script:wslDistro) }
+        [void]$prefix.Add('--'); [void]$prefix.Add('adb')
+        try { $script:adb = [AdbShell]::new($script:wsl, $script:adbSerial, [string[]]$prefix) } catch { $script:adb = $null }
+        return
+    }
+
     if (-not $script:adbPath) { return }
+    if ((Get-Date) -lt $script:adbNextTry) { return }
     $out = Invoke-AdbCli @('connect', $script:adbSerial)
     if ($out -match 'connected to|already connected') {
         try { $script:adb = [AdbShell]::new($script:adbPath, $script:adbSerial) } catch { $script:adb = $null }
+    } else {
+        $script:adbNextTry = (Get-Date).AddSeconds(60)
     }
 }
 
@@ -1027,6 +1377,15 @@ $script:frameTimer.Add_Tick({
                 if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
                 if ($script:sessionRunning) { Initialize-Adb }
             }
+            # WSLg restarts msrdc after a Weston crash. All RAIL windows die
+            # with it, so tell the user how to bring Android windows back.
+            $msrdc = @(Get-Process msrdc -ErrorAction SilentlyContinue)
+            if ($msrdc.Count -gt 0) {
+                if ($script:msrdcId -ne 0 -and $msrdc[0].Id -ne $script:msrdcId) {
+                    Set-Footer 'Графика WSL перезапустилась. Нажмите «Перезапустить Android», чтобы вернуть окна Android.'
+                }
+                $script:msrdcId = $msrdc[0].Id
+            }
         }
     } catch { }
 })
@@ -1041,6 +1400,7 @@ $launchTimer.Add_Tick({
     if ($sec -lt 60) { $loaderElapsed.Text = "$sec сек" } else { $loaderElapsed.Text = ('{0}:{1:00}' -f [int]($sec / 60), ($sec % 60)) }
 
     if ($sec -eq 5) { $loaderSub.Text = 'Приложение открывается…' }
+    elseif ($sec -eq 25) { $loaderSub.Text = 'Окно пока не появилось. Если графика WSL зависла, нажмите «Перезапустить Android» в главном окне Winoid.' }
     elseif ($sec -eq 30) { $loaderSub.Text = 'Идёт первый запуск. Android распаковывает данные и транслирует ARM-код — это может занять несколько минут.' }
     elseif ($sec -eq 90) { $loaderSub.Text = 'Всё ещё загружается. Не закрывайте приложение; индикатор можно скрыть.' }
 
@@ -1083,6 +1443,20 @@ function Start-AppLaunch($app) {
         Focus-Wrapper $existing
         Set-Footer "Окно «$($app.Name)» уже открыто."
         return
+    }
+
+    if ($app.Package -eq 'com.android.vending') {
+        $answer = [System.Windows.MessageBox]::Show(
+            $window,
+            'Play Store в WSL2 иногда роняет графику WSL, и окна Android могут исчезнуть. Если это случится, нажмите «Перезапустить Android» в главном окне Winoid и попробуйте снова. Продолжить?',
+            'Winoid — Play Store',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning,
+            [System.Windows.MessageBoxResult]::No)
+        if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
+            Set-Footer 'Play Store не запущен.'
+            return
+        }
     }
 
     $script:launchState = [pscustomobject]@{
@@ -1163,6 +1537,232 @@ function Install-Apk([string]$path) {
     $installTimer.Start()
 }
 
+function ConvertTo-WslPath([string]$path) {
+    $full = [System.IO.Path]::GetFullPath($path)
+    if ($full -match '^([A-Za-z]):\\(.*)$') {
+        return '/mnt/' + $matches[1].ToLowerInvariant() + '/' + ($matches[2] -replace '\\', '/')
+    }
+    return ($full -replace '\\', '/')
+}
+
+function Convert-PngToIco([string]$pngPath, [string]$icoPath) {
+    Add-Type -AssemblyName System.Drawing
+    $src = [System.Drawing.Image]::FromFile($pngPath)
+    try {
+        $sizes = @(16, 24, 32, 48, 64, 128, 256)
+        $pngs = New-Object System.Collections.Generic.List[byte[]]
+        foreach ($s in $sizes) {
+            $bmp = New-Object System.Drawing.Bitmap $s, $s, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $scale = [Math]::Min($s / $src.Width, $s / $src.Height)
+            $w = [Math]::Max(1, [int][Math]::Round($src.Width * $scale))
+            $h = [Math]::Max(1, [int][Math]::Round($src.Height * $scale))
+            $x = [int](($s - $w) / 2)
+            $y = [int](($s - $h) / 2)
+            $g.DrawImage($src, $x, $y, $w, $h)
+            $ms = New-Object System.IO.MemoryStream
+            $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $pngs.Add($ms.ToArray())
+            $ms.Dispose(); $g.Dispose(); $bmp.Dispose()
+        }
+
+        $ms = New-Object System.IO.MemoryStream
+        $bw = New-Object System.IO.BinaryWriter $ms
+        $bw.Write([UInt16]0)
+        $bw.Write([UInt16]1)
+        $bw.Write([UInt16]$sizes.Count)
+        $offset = 6 + 16 * $sizes.Count
+        for ($i = 0; $i -lt $sizes.Count; $i++) {
+            $s = $sizes[$i]
+            $bw.Write([Byte]$(if ($s -ge 256) { 0 } else { $s }))
+            $bw.Write([Byte]$(if ($s -ge 256) { 0 } else { $s }))
+            $bw.Write([Byte]0)
+            $bw.Write([Byte]0)
+            $bw.Write([UInt16]1)
+            $bw.Write([UInt16]32)
+            $bw.Write([UInt32]$pngs[$i].Length)
+            $bw.Write([UInt32]$offset)
+            $offset += $pngs[$i].Length
+        }
+        foreach ($png in $pngs) { $bw.Write($png) }
+        $bw.Flush()
+        $dir = Split-Path -Parent $icoPath
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllBytes($icoPath, $ms.ToArray())
+        $bw.Dispose(); $ms.Dispose()
+    } finally {
+        $src.Dispose()
+    }
+}
+
+function Get-AppIconPath($app) {
+    $generic = Join-Path $script:baseDir 'assets\android.ico'
+    $dex = Join-Path $script:baseDir 'assets\winoid-icon.dex'
+    if (-not (Test-Path -LiteralPath $dex)) { return $generic }
+
+    $iconsDir = Join-Path $script:dataRoot 'icons'
+    if (-not (Test-Path -LiteralPath $iconsDir)) { New-Item -ItemType Directory -Path $iconsDir -Force | Out-Null }
+    $ico = Join-Path $iconsDir ($app.Package + '.ico')
+    $remoteDex = '/data/local/tmp/winoid-icon.dex'
+    $remotePng = '/data/local/tmp/winoid-icon-' + $app.Package + '.png'
+    $localPng = Join-Path $env:TEMP ('winoid-icon-' + [Guid]::NewGuid().ToString('N') + '.png')
+    $ok = $false
+
+    # Windows ADB is preferred; WSL ADB is the fallback when a VPN swallows
+    # the route to the Waydroid subnet.
+    if ($script:adbPath) {
+        try {
+            $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 8000
+            if ($state -notmatch '^device') {
+                $null = Invoke-AdbCli -Arguments @('connect', $script:adbSerial) -TimeoutMs 12000
+                $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 8000
+            }
+            if ($state -match '^device') {
+                $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 20000
+                $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
+                $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 25000
+                if ($res -match 'OK') {
+                    $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'pull', $remotePng, $localPng) -TimeoutMs 20000
+                    if (Test-Path -LiteralPath $localPng) { $ok = $true }
+                }
+            }
+        } catch { }
+    }
+
+    if (-not $ok) {
+        try {
+            $stateArgs = (Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'get-state')
+            $r = Invoke-Wsl $stateArgs 15000
+            if ($r.Out -notmatch 'device') {
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', 'connect', $script:adbSerial)) 15000
+                $r = Invoke-Wsl $stateArgs 15000
+            }
+            if ($r.Code -eq 0 -and $r.Out -match 'device') {
+                $linuxDex = ConvertTo-WslPath $dex
+                $linuxPng = ConvertTo-WslPath $localPng
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) 20000
+                $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
+                $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 25000
+                if ($res.Out -match 'OK') {
+                    $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'pull', $remotePng, $linuxPng)) 20000
+                    if (Test-Path -LiteralPath $localPng) { $ok = $true }
+                }
+            }
+        } catch { }
+    }
+
+    if ($ok) {
+        try {
+            Convert-PngToIco $localPng $ico
+            Remove-Item -LiteralPath $localPng -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $ico) { return $ico }
+        } catch { }
+    }
+    Remove-Item -LiteralPath $localPng -Force -ErrorAction SilentlyContinue
+    return $generic
+}
+
+function Update-AppShortcutIconAsync($app, [string]$lnkPath) {
+    $generic = Join-Path $script:baseDir 'assets\android.ico'
+    $dex = Join-Path $script:baseDir 'assets\winoid-icon.dex'
+    $worker = Join-Path $script:baseDir 'assets\iconjob.ps1'
+    if (-not (Test-Path -LiteralPath $dex) -or -not (Test-Path -LiteralPath $worker) -or -not (Test-Path -LiteralPath $lnkPath)) { return }
+    $iconsDir = Join-Path $script:dataRoot 'icons'
+    $ico = Join-Path $iconsDir ($app.Package + '.ico')
+
+    try {
+        $args = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $worker,
+            '-Package', $app.Package,
+            '-Serial', $script:adbSerial,
+            '-WslExe', $script:wsl,
+            '-Distro', $script:wslDistro,
+            '-Dex', $dex,
+            '-Ico', $ico,
+            '-Lnk', $lnkPath,
+            '-Generic', $generic
+        )
+        # Start-Process joins -ArgumentList with spaces and does not quote
+        # paths, and the Winoid folder can contain spaces.
+        $quoted = @($args | ForEach-Object { '"' + ([string]$_) + '"' })
+        Start-Process -FilePath 'pwsh.exe' -ArgumentList $quoted -WindowStyle Hidden | Out-Null
+    } catch { }
+}
+
+function New-AppShortcut($app) {
+    if ($null -eq $app) { return }
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $safe = ($app.Name -replace '[\\/:*?"<>|]', '_').Trim().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = $app.Package }
+    if ($safe.Length -gt 64) { $safe = $safe.Substring(0, 64).Trim() }
+
+    $target = Join-Path $script:baseDir 'Winoid.cmd'
+    $arguments = '-Launch "' + $app.Package + '"'
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = Join-Path $desktop ($safe + '.lnk')
+    if (Test-Path -LiteralPath $lnk) {
+        try {
+            $old = $shell.CreateShortcut($lnk)
+            if ($old.TargetPath -ne $target) {
+                $lnk = Join-Path $desktop ($safe + ' (' + $app.Package + ').lnk')
+            }
+        } catch { }
+    }
+
+    $generic = Join-Path $script:baseDir 'assets\android.ico'
+    $sc = $shell.CreateShortcut($lnk)
+    $sc.TargetPath = $target
+    $sc.Arguments = $arguments
+    $sc.WorkingDirectory = $script:baseDir
+    if (Test-Path -LiteralPath $generic) { $sc.IconLocation = "$generic,0" }
+    $sc.Description = "$($app.Name) — Android-приложение (Winoid)"
+    $sc.Save()
+    Set-Footer "Ярлык «$([System.IO.Path]::GetFileNameWithoutExtension($lnk))» создан. Обновляю иконку приложения…"
+    Update-AppShortcutIconAsync $app $lnk
+}
+
+function Process-Requests {
+    if (-not (Test-Path -LiteralPath $script:requestDir)) { return }
+    $files = @(Get-ChildItem -LiteralPath $script:requestDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTime)
+    foreach ($file in $files) {
+        $req = $null
+        try { $req = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { }
+        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        if ($null -eq $req) { continue }
+        if (((Get-Date) - $file.CreationTime).TotalMinutes -gt 10) { continue }
+
+        $target = [string]$req.target
+        if ($req.action -eq 'install') {
+            if ($target -and (Test-Path -LiteralPath $target)) { Install-Apk $target }
+            else { Set-Footer 'Ярлык: APK-файл не найден.' }
+            continue
+        }
+
+        $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
+        if (-not $app) {
+            Refresh-Apps
+            $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
+        }
+        if ($app) { Start-AppLaunch $app }
+        elseif ($target) { Set-Footer "Ярлык: приложение $target не найдено в Android." }
+    }
+}
+
+$requestTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$requestTimer.Interval = [TimeSpan]::FromSeconds(1)
+$requestTimer.Add_Tick({ Process-Requests })
+
+$driveTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$driveTimer.Interval = [TimeSpan]::FromSeconds(2)
+$driveTimer.Add_Tick({
+    $driveTimer.Stop()
+    Mount-AndroidDrive | Out-Null
+})
+
 $sessionTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $sessionTimer.Interval = [TimeSpan]::FromSeconds(2)
 $sessionTimer.Add_Tick({
@@ -1188,6 +1788,11 @@ $sessionTimer.Add_Tick({
         Refresh-Apps
         Initialize-Adb
         Set-Footer 'Android запущен.'
+        if ($script:pendingAndroidWindow) {
+            $pending = $script:pendingAndroidWindow
+            $script:pendingAndroidWindow = $null
+            Start-AndroidWindow $pending.Package $pending.Title
+        }
     } elseif ($script:sessionTicks -ge 90) {
         $sessionTimer.Stop()
         $loader.Hide()
@@ -1196,7 +1801,32 @@ $sessionTimer.Add_Tick({
     }
 })
 
+# Opens a standalone Android window (launcher or Settings). In Waydroid
+# multi-window mode `show-full-ui` is a no-op, so the launcher is the
+# closest thing to "Android as a whole" that still works.
+function Start-AndroidWindow([string]$package, [string]$title) {
+    if (-not (Test-Backend)) {
+        $backendBtn.Visibility = 'Visible'
+        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
+        return
+    }
+    if (-not $script:sessionRunning) {
+        $script:pendingAndroidWindow = [pscustomobject]@{ Package = $package; Title = $title }
+        Start-Session
+        return
+    }
+    $app = $script:apps | Where-Object { $_.Package -eq $package } | Select-Object -First 1
+    if ($app) {
+        Start-AppLaunch $app
+        return
+    }
+    $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $package"
+    Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
+    Set-Footer "Открываю $title…"
+}
+
 function Start-Session {
+    param([switch]$Restart)
     if (-not (Test-Backend)) {
         $backendBtn.Visibility = 'Visible'
         Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
@@ -1204,20 +1834,21 @@ function Start-Session {
     }
     $script:sessionTicks = 0
     $script:sessionWaiting = $false
-    $loaderTitle.Text = 'Запуск Android'
-    $loaderSub.Text = 'Поднимаю контейнер и сессию Waydroid. Это займёт до минуты.'
+    $loaderTitle.Text = $(if ($Restart) { 'Перезапуск Android' } else { 'Запуск Android' })
+    $loaderSub.Text = $(if ($Restart) { 'Перезапускаю сессию Waydroid, чтобы окна снова подключились к графике WSL.' } else { 'Поднимаю контейнер и сессию Waydroid. Это займёт до минуты.' })
     $loaderElapsed.Text = '0 сек'
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
-    Set-Footer 'Запуск Android…'
+    Set-Footer $(if ($Restart) { 'Перезапуск Android…' } else { 'Запуск Android…' })
     $jobWsl = $script:wsl
     $jobDistro = $script:wslDistro
+    $action = $(if ($Restart) { 'restart' } else { 'start' })
     $script:sessionJob = Start-Job -ScriptBlock {
-        param($wslExe, $distro)
+        param($wslExe, $distro, $verb)
         $wslArgs = @()
         if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
-        & $wslExe @wslArgs -- bash -lc 'systemctl --user start waydroid-session.service' 2>&1
-    } -ArgumentList $jobWsl, $jobDistro
+        & $wslExe @wslArgs -- bash -lc "systemctl --user $verb waydroid-session.service" 2>&1
+    } -ArgumentList $jobWsl, $jobDistro, $action
     $sessionTimer.Start()
 }
 
@@ -1228,11 +1859,16 @@ $refreshBtn.Add_Click({
     Test-Session | Out-Null
     Refresh-Apps
 })
-$appsList.Add_SelectionChanged({ $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem) })
+$appsList.Add_SelectionChanged({
+    $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+    $shortcutBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+})
 $appsList.Add_MouseDoubleClick({
     if ($null -ne $appsList.SelectedItem) { Start-AppLaunch $appsList.SelectedItem }
 })
 $launchBtn.Add_Click({ Start-AppLaunch $appsList.SelectedItem })
+$shortcutBtn.Add_Click({ New-AppShortcut $appsList.SelectedItem })
+$driveBtn.Add_Click({ Mount-AndroidDrive -Open | Out-Null })
 $installBtn.Add_Click({
     $dlg = [Microsoft.Win32.OpenFileDialog]::new()
     $dlg.Title = 'Выберите APK'
@@ -1251,13 +1887,10 @@ $backendBtn.Add_Click({
     }
 })
 $fullUiBtn.Add_Click({
-    if (-not $script:sessionRunning) {
-        Start-Session
-        return
-    }
-    $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid show-full-ui'
-    Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
-    Set-Footer 'Открываю Android…'
+    Start-Session -Restart
+})
+$settingsBtn.Add_Click({
+    Start-AndroidWindow 'com.android.settings' 'Настройки Android'
 })
 $showWindowBtn.Add_Click({
     if ($script:launchState) {
@@ -1284,6 +1917,9 @@ $window.Add_Closing({
     $launchTimer.Stop()
     $installTimer.Stop()
     $sessionTimer.Stop()
+    $requestTimer.Stop()
+    $driveTimer.Stop()
+    try { Disconnect-AndroidDrive } catch { }
     $script:frameTimer.Stop()
     $script:bounceTimer.Stop()
     foreach ($w in @($script:wrappers)) {
@@ -1304,9 +1940,10 @@ $window.Add_Closing({
 $window.Add_Closed({ [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() })
 $window.Add_Loaded({
     Start-WslKeepAlive
-    Test-Session | Out-Null
+    if (-not (Test-Session)) { Start-Session }
     Refresh-Apps
     Initialize-Adb
+    $driveTimer.Start()
     if ($Install) { Install-Apk $Install }
     if ($Launch) {
         $app = $script:apps | Where-Object { $_.Package -eq $Launch -or $_.Name -eq $Launch } | Select-Object -First 1
@@ -1316,5 +1953,6 @@ $window.Add_Loaded({
 $loader.Add_Closing({ $_.Cancel = $true; $loader.Hide() })
 
 $script:frameTimer.Start()
+$requestTimer.Start()
 $window.Show()
 [System.Windows.Threading.Dispatcher]::Run()

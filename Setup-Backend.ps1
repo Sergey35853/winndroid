@@ -624,7 +624,7 @@ fi
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y curl ca-certificates gnupg lzip git python3-venv
+apt-get install -y curl ca-certificates gnupg lzip git python3-venv acl
 curl -s https://repo.waydro.id | bash
 apt-get install -y waydroid
 systemctl enable --now waydroid-container.service
