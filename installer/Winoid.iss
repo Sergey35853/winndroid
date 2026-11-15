@@ -1,6 +1,6 @@
 #define MyAppName "Winoid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.6"
+  #define MyAppVersion "0.1.7"
 #endif
 #define MyAppPublisher "Sergey35853"
 #define MyAppURL "https://github.com/Sergey35853/winoid"
@@ -40,6 +40,7 @@ Name: "setupbackend"; Description: "Open Android backend setup after installatio
 [Files]
 Source: "..\Winoid.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Winoid.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Winoid.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Setup-Backend.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -51,13 +52,13 @@ Source: "..\docs\screenshot-manager.png"; DestDir: "{app}\docs"; Flags: ignoreve
 Source: "Setup-ADB.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\android.ico"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\android.ico"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{sys}\wscript.exe"; Parameters: "//B ""{app}\Winoid.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\android.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{sys}\wscript.exe"; Parameters: "//B ""{app}\Winoid.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\android.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\Setup-ADB.ps1"""; StatusMsg: "Downloading Android platform-tools..."; Flags: runhidden waituntilterminated; Tasks: downloadadb
 Filename: "pwsh.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Setup-Backend.ps1"""; WorkingDir: "{app}"; Description: "Set up Android backend"; Flags: postinstall nowait skipifsilent; Tasks: setupbackend
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{sys}\wscript.exe"; Parameters: "//B ""{app}\Winoid.vbs"""; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function InitializeSetup(): Boolean;

@@ -55,7 +55,7 @@ jobs:
         run: |
           $stage = Join-Path $PWD 'stage'
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item Winoid.ps1, Winoid.cmd, Setup-Backend.ps1, README.md, LICENSE, config.example.json $stage
+          Copy-Item Winoid.ps1, Winoid.cmd, Winoid.vbs, Setup-Backend.ps1, README.md, LICENSE, config.example.json $stage
           Copy-Item assets $stage -Recurse
           Copy-Item docs $stage -Recurse
           $zip = "dist\Winoid-${{ steps.ver.outputs.version }}-portable.zip"

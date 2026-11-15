@@ -6,6 +6,11 @@ if not exist "%APP%" (
     pause
     exit /b 1
 )
+if not exist "%~dp0Winoid.vbs" (
+    echo Winoid.vbs was not found next to this launcher.
+    pause
+    exit /b 1
+)
 where pwsh.exe >nul 2>nul
 if errorlevel 1 (
     echo PowerShell 7 is required.
@@ -13,5 +18,5 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-start "" pwsh.exe -NoProfile -Sta -ExecutionPolicy Bypass -WindowStyle Hidden -File "%APP%" %*
+start "" wscript.exe //B "%~dp0Winoid.vbs" %*
 exit /b 0
