@@ -64,6 +64,7 @@ if (-not $script:instanceMutex.WaitOne(0)) {
 Add-Type -TypeDefinition @"
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -86,6 +87,7 @@ public class NativeWin {
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
@@ -109,6 +111,34 @@ public class NativeWin {
     [StructLayout(LayoutKind.Sequential)]
     public struct BITMAPINFO { public BITMAPINFOHEADER bmiHeader; }
     public delegate bool EnumProc(IntPtr h, IntPtr lp);
+
+    public class WinInfo {
+        public IntPtr Hwnd;
+        public IntPtr RootOwner;
+        public string Title;
+        public int Left, Top, Right, Bottom;
+        public bool Visible;
+        public int Width { get { return Right - Left; } }
+        public int Height { get { return Bottom - Top; } }
+    }
+
+    public static WinInfo[] ListWindows(uint pid) {
+        var list = new List<WinInfo>();
+        EnumWindows((h, lp) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p != pid) return true;
+            var sb = new StringBuilder(512);
+            GetWindowText(h, sb, 512);
+            if (sb.Length == 0) return true;
+            RECT r; GetWindowRect(h, out r);
+            list.Add(new WinInfo {
+                Hwnd = h, RootOwner = GetAncestor(h, 3), Title = sb.ToString(), Visible = IsWindowVisible(h),
+                Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom
+            });
+            return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
 
     public static IntPtr FindWindowContains(string needle, string exclude) {
         IntPtr found = IntPtr.Zero;
@@ -215,14 +245,14 @@ public class AdbShell : IDisposable {
 
     public void Send(string cmd) {
         if (!Running) throw new InvalidOperationException("adb shell is not running");
-        _p.StandardInput.WriteLine(cmd);
+        _p.StandardInput.Write(cmd + "\n");
         _p.StandardInput.Flush();
     }
 
     public long SendSync(string cmd, int timeoutMs) {
         string marker = "M" + Guid.NewGuid().ToString("N");
         var sw = Stopwatch.StartNew();
-        _p.StandardInput.WriteLine(cmd + "; echo " + marker);
+        _p.StandardInput.Write(cmd + "; echo " + marker + "\n");
         _p.StandardInput.Flush();
         string line;
         while (sw.ElapsedMilliseconds < timeoutMs) {
@@ -606,26 +636,77 @@ $loaderXaml = @'
 </Window>
 '@
 
+$script:wrapperNavHeight = 44
+
 $script:wrapperXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Width="1280" Height="820" MinWidth="360" MinHeight="260"
+        Width="1280" Height="860" MinWidth="360" MinHeight="300"
         WindowStartupLocation="CenterScreen" Background="#0B0C0E">
-  <Grid>
-    <Image x:Name="View" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
-    <Border x:Name="Loading" Background="#E60B0C0E">
-      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
-        <Border Width="46" Height="46" CornerRadius="12" Background="#2A3550" HorizontalAlignment="Center">
-          <TextBlock Text="A" Foreground="#7EA6FF" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-        </Border>
-        <TextBlock x:Name="LoadingText" Text="Приложение запускается…" Foreground="#D6DAE2" FontSize="14" Margin="0,16,0,0" HorizontalAlignment="Center"/>
-      </StackPanel>
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#26282F"/>
+      <Setter Property="Foreground" Value="#F1F3F5"/>
+      <Setter Property="BorderBrush" Value="#34363E"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="12,7"/>
+      <Setter Property="Margin" Value="0,0,6,0"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#32353D"/></Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="Bd" Property="Background" Value="#3D7EFF"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#A9AEBA"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+  </Window.Resources>
+  <DockPanel LastChildFill="True">
+    <Border DockPanel.Dock="Bottom" Height="44" Background="#15171C"
+            BorderBrush="#2A2C33" BorderThickness="0,1,0,0">
+      <Grid Margin="10,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="BackBtn" Content="◀  Назад" ToolTip="Назад в Android (Esc, Backspace или Alt+←)"/>
+          <Button x:Name="HomeBtn" Content="●  Домой" ToolTip="На главный экран Android (Home)"/>
+          <Button x:Name="RecentsBtn" Content="■  Недавние" ToolTip="Недавние приложения Android"/>
+        </StackPanel>
+        <TextBlock Grid.Column="1" Text="Android-навигация" FontSize="11"
+                   HorizontalAlignment="Right" VerticalAlignment="Center"/>
+      </Grid>
     </Border>
-    <Border x:Name="Hint" Background="#CC101318" CornerRadius="10" Padding="14,10"
-            HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,18">
-      <TextBlock Text="Нажмите на окно — ввод пойдёт в Android" Foreground="#D6DAE2" FontSize="12"/>
-    </Border>
-  </Grid>
+    <Grid>
+      <Image x:Name="View" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <Border x:Name="Loading" Background="#E60B0C0E">
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+          <Border Width="46" Height="46" CornerRadius="12" Background="#2A3550" HorizontalAlignment="Center">
+            <TextBlock Text="A" Foreground="#7EA6FF" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <TextBlock x:Name="LoadingText" Text="Приложение запускается…" Foreground="#D6DAE2" FontSize="14" Margin="0,16,0,0" HorizontalAlignment="Center"/>
+        </StackPanel>
+      </Border>
+      <Border x:Name="Hint" Background="#CC101318" CornerRadius="10" Padding="14,10"
+              HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,18">
+        <TextBlock Text="Нажмите на окно — ввод пойдёт в Android" Foreground="#D6DAE2" FontSize="12"/>
+      </Border>
+    </Grid>
+  </DockPanel>
 </Window>
 '@
 
@@ -1170,26 +1251,127 @@ function Map-WrapperPoint($w, $pos) {
     return @($sx, $sy)
 }
 
+function Get-AppDisplayName($app) {
+    if ($null -eq $app) { return '' }
+    if ($app.Package -eq 'com.android.settings') { return 'Настройки Android' }
+    try {
+        if ($app.PSObject.Properties['DisplayName'] -and -not [string]::IsNullOrWhiteSpace($app.DisplayName)) {
+            return [string]$app.DisplayName
+        }
+    } catch { }
+    return [string]$app.Name
+}
+
+# Collects the Windows windows that together make up one Android app.
+# Android Settings uses two side-by-side task fragments on a large screen:
+# a list and a detail pane. Both are separate WSLg windows, so they have to
+# be captured and shown as one virtual screen.
+function Get-AppPanes($app, [IntPtr]$source) {
+    $cr = New-Object NativeWin+RECT
+    [void][NativeWin]::GetClientRect($source, [ref]$cr)
+    $pw = [Math]::Max(1, $cr.Right)
+    $ph = [Math]::Max(1, $cr.Bottom)
+    $wr = New-Object NativeWin+RECT
+    [void][NativeWin]::GetWindowRect($source, [ref]$wr)
+
+    $procId = [uint32]0
+    [void][NativeWin]::GetWindowThreadProcessId($source, [ref]$procId)
+    $wins = @()
+    try { $wins = @([NativeWin]::ListWindows($procId)) } catch { }
+
+    # The Android navigation bar is a separate bottom strip. Its height is
+    # cropped from the app panes and replaced by Winoid's own navigation bar.
+    $navInset = 0
+    $displayW = 0
+    foreach ($wnd in $wins) {
+        if (-not $wnd.Visible) { continue }
+        $ww = $wnd.Width; $wh = $wnd.Height
+        if ($ww -lt 200 -or $wh -lt 20 -or $wh -gt 140) { continue }
+        if ([math]::Abs($wnd.Bottom - $ph) -gt 8) { continue }
+        if ($ww -lt $pw * 0.9) { continue }
+        $inset = $ph - $wnd.Top
+        if ($inset -ge 20 -and $inset -le 140 -and $inset -gt $navInset) { $navInset = $inset }
+        if ($ww -gt $displayW) { $displayW = $ww }
+    }
+
+    $panes = New-Object System.Collections.ArrayList
+    [void]$panes.Add([pscustomobject]@{ Source = $source; Left = $wr.Left; Top = $wr.Top; W = $pw; H = $ph })
+
+    if ($app.Package -eq 'com.android.settings') {
+        $companion = $null
+        foreach ($wnd in $wins) {
+            if (-not $wnd.Visible -or $wnd.Hwnd -eq $source) { continue }
+            if ($wnd.Title -notmatch 'sub-surface') { continue }
+            $ww = $wnd.Width; $wh = $wnd.Height
+            if ($ww -lt 200 -or [math]::Abs($wh - $ph) -gt 12) { continue }
+            if ($displayW -gt 0 -and [math]::Abs(($pw + $ww) - $displayW) -gt 48) { continue }
+            if ($displayW -gt 0 -and $ww -ge $displayW - 48) { continue }
+            if ($null -eq $companion -or $ww -gt $companion.Width) { $companion = $wnd }
+        }
+        if ($null -ne $companion) {
+            $ccr = New-Object NativeWin+RECT
+            [void][NativeWin]::GetClientRect($companion.Hwnd, [ref]$ccr)
+            [void]$panes.Add([pscustomobject]@{
+                Source = $companion.Hwnd
+                Left = $wr.Left + $pw
+                Top = $wr.Top
+                W = [Math]::Max(1, $ccr.Right)
+                H = [Math]::Max(1, $ccr.Bottom)
+            })
+        }
+    }
+
+    $minLeft = $wr.Left; $minTop = $wr.Top
+    $maxRight = $wr.Left + $pw; $maxBottom = $wr.Top + $ph
+    foreach ($p in $panes) {
+        if ($p.Left -lt $minLeft) { $minLeft = $p.Left }
+        if ($p.Top -lt $minTop) { $minTop = $p.Top }
+        if (($p.Left + $p.W) -gt $maxRight) { $maxRight = $p.Left + $p.W }
+        if (($p.Top + $p.H) -gt $maxBottom) { $maxBottom = $p.Top + $p.H }
+    }
+    $height = $maxBottom - $minTop - $navInset
+    if ($height -lt 100) { $height = $maxBottom - $minTop; $navInset = 0 }
+
+    return [pscustomobject]@{
+        Panes = @($panes)
+        Windows = $wins
+        RootOwner = [NativeWin]::GetAncestor($source, 3)
+        NavInset = $navInset
+        MinLeft = $minLeft
+        MinTop = $minTop
+        Width = $maxRight - $minLeft
+        Height = $height
+    }
+}
+
 function Restore-Source($w) {
-    if (-not [NativeWin]::IsWindow($w.Source)) { return }
-    [void][NativeWin]::SetWindowLong($w.Source, -20, $w.OrigExStyle)
-    $r = $w.OrigRect
-    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $x = $r.Left; $y = $r.Top
-    if ($x -ge $wa.Right -or $y -ge $wa.Bottom) { $x = 0; $y = 0 }
-    [void][NativeWin]::SetWindowPos($w.Source, [IntPtr]::Zero, $x, $y, [Math]::Max(320, $r.Right - $r.Left), [Math]::Max(240, $r.Bottom - $r.Top), 0x0010)
-    if ($w.WasZoomed) { [void][NativeWin]::ShowWindow($w.Source, 3) }
+    foreach ($pane in (@($w.Panes) + @($w.Parked))) {
+        if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
+        [void][NativeWin]::SetWindowLong($pane.Source, -20, $pane.OrigExStyle)
+        $r = $pane.OrigRect
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $x = $r.Left; $y = $r.Top
+        if ($x -ge $wa.Right -or $y -ge $wa.Bottom) { $x = 0; $y = 0 }
+        [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $x, $y, [Math]::Max(320, $r.Right - $r.Left), [Math]::Max(240, $r.Bottom - $r.Top), 0x0010)
+        if ($pane.WasZoomed) { [void][NativeWin]::ShowWindow($pane.Source, 3) }
+    }
 }
 
 function Remove-Wrapper($w, [bool]$closeSource) {
     if ($null -eq $w -or $w.Closed) { return }
     $w.Closed = $true
-    try { $w.Grab.Dispose() } catch { }
+    foreach ($pane in @($w.Panes)) {
+        try { $pane.Grab.Dispose() } catch { }
+    }
     try { $script:wrapByImage.Remove($w.Image) } catch { }
     try { $script:wrapByWindow.Remove($w.Window) } catch { }
     try { [void]$script:wrappers.Remove($w) } catch { }
-    if ($closeSource -and [NativeWin]::IsWindow($w.Source)) {
-        [void][NativeWin]::PostMessage($w.Source, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+    if ($closeSource) {
+        foreach ($pane in @($w.Panes)) {
+            if ($null -ne $pane -and [NativeWin]::IsWindow($pane.Source)) {
+                [void][NativeWin]::PostMessage($pane.Source, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            }
+        }
     }
     try { $w.Window.Close() } catch { }
 }
@@ -1208,41 +1390,97 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         if (-not $old.Closed -and $old.Source -eq $source) { Focus-Wrapper $old; return $old }
     }
 
-    $cr = New-Object NativeWin+RECT
-    [void][NativeWin]::GetClientRect($source, [ref]$cr)
-    $srcW = $cr.Right; $srcH = $cr.Bottom
-    if ($srcW -lt 100 -or $srcH -lt 100) { return $null }
+    $spec = Get-AppPanes $app $source
+    $panes = @($spec.Panes)
+    $srcW = [int]$spec.Width
+    $srcH = [int]$spec.Height
+    if ($panes.Count -eq 0 -or $srcW -lt 100 -or $srcH -lt 60) { return $null }
+    $displayName = Get-AppDisplayName $app
 
-    $wr = New-Object NativeWin+RECT
-    [void][NativeWin]::GetWindowRect($source, [ref]$wr)
-    $origEx = [NativeWin]::GetWindowLong($source, -20)
-    $wasZoomed = [NativeWin]::IsZoomed($source)
-
-    # Park the RAIL window off the visible desktop and keep it out of the taskbar.
-    # A maximized window ignores SetWindowPos until it has finished restoring.
-    if ($wasZoomed) {
-        [void][NativeWin]::ShowWindow($source, 9)
-        for ($i = 0; $i -lt 20 -and [NativeWin]::IsZoomed($source); $i++) {
-            [System.Threading.Thread]::Sleep(25)
+    # WSLg splits an Android window into a top-level frame and one or more
+    # sub-surface windows (content, navigation bar, dialogs). Only the panes
+    # are captured; every other surface owned by the same top-level window is
+    # parked off-screen too, otherwise it stays on top of the Winoid wrapper.
+    $paneSources = New-Object 'System.Collections.Generic.HashSet[System.IntPtr]'
+    foreach ($pane in $panes) { [void]$paneSources.Add($pane.Source) }
+    $parked = New-Object System.Collections.ArrayList
+    foreach ($wnd in @($spec.Windows)) {
+        if ($null -eq $wnd -or -not $wnd.Visible) { continue }
+        if ($wnd.RootOwner -ne $spec.RootOwner) { continue }
+        if ($paneSources.Contains($wnd.Hwnd)) { continue }
+        if ($wnd.Width -lt 20 -or $wnd.Height -lt 20) { continue }
+        $extraEx = [NativeWin]::GetWindowLong($wnd.Hwnd, -20)
+        $extraZoomed = [NativeWin]::IsZoomed($wnd.Hwnd)
+        $extraRect = New-Object NativeWin+RECT
+        [void][NativeWin]::GetWindowRect($wnd.Hwnd, [ref]$extraRect)
+        if ($extraZoomed) {
+            [void][NativeWin]::ShowWindow($wnd.Hwnd, 9)
+            for ($i = 0; $i -lt 20 -and [NativeWin]::IsZoomed($wnd.Hwnd); $i++) {
+                [System.Threading.Thread]::Sleep(25)
+            }
         }
+        $extraParkedEx = (($extraEx -bor 0x00000080) -band (-bnot 0x00040000))
+        [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, $extraParkedEx)
+        $parkX = 3000 + [Math]::Max(0, $wnd.Left - $spec.MinLeft)
+        [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, $parkX, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
+        [void]$parked.Add([pscustomobject]@{
+            Source = $wnd.Hwnd
+            OrigExStyle = (($extraEx -bor 0x00040000) -band (-bnot 0x00000080))
+            OrigRect = $extraRect
+            WasZoomed = $extraZoomed
+            ParkX = $parkX
+            ParkY = 0
+            W = [int]$wnd.Width
+            H = [int]$wnd.Height
+        })
     }
-    $parkedEx = (($origEx -bor 0x00000080) -band (-bnot 0x00040000))
-    [void][NativeWin]::SetWindowLong($source, -20, $parkedEx)
-    [void][NativeWin]::SetWindowPos($source, [IntPtr]::Zero, 3000, 0, $srcW, $srcH, 0x0010)
-    if ($wasZoomed) {
-        [System.Threading.Thread]::Sleep(120)
-        [void][NativeWin]::SetWindowPos($source, [IntPtr]::Zero, 3000, 0, $srcW, $srcH, 0x0010)
+
+    # Remember where every pane was and park all of them off-screen. The
+    # Android nav bar strip is cropped from the captured image, so each
+    # pane keeps its full height while only the visible part is shown.
+    foreach ($pane in $panes) {
+        $paneOrigEx = [NativeWin]::GetWindowLong($pane.Source, -20)
+        $paneZoomed = [NativeWin]::IsZoomed($pane.Source)
+        $paneRect = New-Object NativeWin+RECT
+        [void][NativeWin]::GetWindowRect($pane.Source, [ref]$paneRect)
+        $vx = [int]($pane.Left - $spec.MinLeft)
+        $vy = [int]($pane.Top - $spec.MinTop)
+        $visH = [int]($pane.H - $spec.NavInset)
+        if ($visH -gt ($srcH - $vy)) { $visH = $srcH - $vy }
+        if ($visH -lt 1) { $visH = [int]$pane.H }
+        [void]$pane.PSObject.Properties.Remove('Grab')
+        $pane | Add-Member -NotePropertyName VX -NotePropertyValue $vx -Force
+        $pane | Add-Member -NotePropertyName VY -NotePropertyValue $vy -Force
+        $pane | Add-Member -NotePropertyName VisH -NotePropertyValue $visH -Force
+        $pane | Add-Member -NotePropertyName OrigExStyle -NotePropertyValue (($paneOrigEx -bor 0x00040000) -band (-bnot 0x00000080)) -Force
+        $pane | Add-Member -NotePropertyName OrigRect -NotePropertyValue $paneRect -Force
+        $pane | Add-Member -NotePropertyName WasZoomed -NotePropertyValue $paneZoomed -Force
+        $pane | Add-Member -NotePropertyName Grab -NotePropertyValue ([FrameGrabber]::new([int]$pane.W, [int]$pane.H)) -Force
+
+        if ($paneZoomed) {
+            [void][NativeWin]::ShowWindow($pane.Source, 9)
+            for ($i = 0; $i -lt 20 -and [NativeWin]::IsZoomed($pane.Source); $i++) {
+                [System.Threading.Thread]::Sleep(25)
+            }
+        }
+        $parkedEx = (($paneOrigEx -bor 0x00000080) -band (-bnot 0x00040000))
+        [void][NativeWin]::SetWindowLong($pane.Source, -20, $parkedEx)
+        [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $vx, 0, [int]$pane.W, [int]$pane.H, 0x0010)
+        if ($paneZoomed) {
+            [System.Threading.Thread]::Sleep(120)
+            [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $vx, 0, [int]$pane.W, [int]$pane.H, 0x0010)
+        }
     }
 
     $w = @{}
     $w.Package = $app.Package
-    $w.AppName = $app.Name
+    $w.AppName = $displayName
     $w.Source = $source
     $w.SrcW = $srcW
     $w.SrcH = $srcH
-    $w.WasZoomed = $wasZoomed
-    $w.OrigExStyle = (($origEx -bor 0x00040000) -band (-bnot 0x00000080))
-    $w.OrigRect = $wr
+    $w.NavInset = $spec.NavInset
+    $w.Panes = $panes
+    $w.Parked = @($parked)
     $w.Closed = $false
     $w.Settled = $false
     $w.LoadPhase = 0
@@ -1252,16 +1490,18 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.LastMoveT = [DateTime]::MinValue
 
     $win = [System.Windows.Markup.XamlReader]::Parse($script:wrapperXaml)
-    $win.Title = "$($app.Name) — Winoid"
+    $win.Title = "$displayName — Winoid"
     if ($null -ne $script:appIcon) { $win.Icon = $script:appIcon }
     $image = $win.FindName('View')
     $hint = $win.FindName('Hint')
     $loading = $win.FindName('Loading')
     $loadingText = $win.FindName('LoadingText')
+    $backBtn = $win.FindName('BackBtn')
+    $homeBtn = $win.FindName('HomeBtn')
+    $recentsBtn = $win.FindName('RecentsBtn')
 
     $wb = New-Object System.Windows.Media.Imaging.WriteableBitmap($srcW, $srcH, 96, 96, [System.Windows.Media.PixelFormats]::Bgr32, $null)
     $image.Source = $wb
-    $grab = [FrameGrabber]::new($srcW, $srcH)
 
     $w.Window = $win
     $w.Image = $image
@@ -1269,8 +1509,6 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.Loading = $loading
     $w.LoadingText = $loadingText
     $w.Wb = $wb
-    $w.Grab = $grab
-    $w.Rect = [System.Windows.Int32Rect]::new(0, 0, $srcW, $srcH)
 
     $image.Add_MouseLeftButtonDown({
         param($sender, $e)
@@ -1324,6 +1562,56 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1] + $dy) 220"
         } catch { }
     })
+    $backBtn.Add_Click({
+        param($sender, $e)
+        try {
+            $owner = [System.Windows.Window]::GetWindow($sender)
+            $w = $script:wrapByWindow[$owner]
+            if ($null -eq $w -or $w.Closed) { return }
+            [NativeWin]::ForceForeground($w.Source)
+            [System.Threading.Thread]::Sleep(120)
+            Send-Android 'input keyevent 4'
+        } catch { }
+    })
+    $homeBtn.Add_Click({
+        param($sender, $e)
+        try {
+            $owner = [System.Windows.Window]::GetWindow($sender)
+            $w = $script:wrapByWindow[$owner]
+            if ($null -eq $w -or $w.Closed) { return }
+            [NativeWin]::ForceForeground($w.Source)
+            [System.Threading.Thread]::Sleep(120)
+            Send-Android 'input keyevent 3'
+        } catch { }
+    })
+    $recentsBtn.Add_Click({
+        param($sender, $e)
+        try {
+            $owner = [System.Windows.Window]::GetWindow($sender)
+            $w = $script:wrapByWindow[$owner]
+            if ($null -eq $w -or $w.Closed) { return }
+            [NativeWin]::ForceForeground($w.Source)
+            [System.Threading.Thread]::Sleep(120)
+            Send-Android 'input keyevent 187'
+        } catch { }
+    })
+    $win.Add_PreviewKeyDown({
+        param($sender, $e)
+        $w = $script:wrapByWindow[$sender]
+        if ($null -eq $w -or $w.Closed) { return }
+        $key = $e.Key.ToString()
+        if ($key -eq 'System') { $key = $e.SystemKey.ToString() }
+        $alt = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Alt) -ne 0)
+        $keyCode = 0
+        if ($key -eq 'Escape' -or $key -eq 'Back' -or $key -eq 'BrowserBack' -or ($key -eq 'Left' -and $alt)) { $keyCode = 4 }
+        elseif ($key -eq 'Home') { $keyCode = 3 }
+        elseif ($key -eq 'Apps' -or $key -eq 'LaunchApplication1') { $keyCode = 187 }
+        if ($keyCode -ne 0) {
+            $e.Handled = $true
+            [NativeWin]::ForceForeground($w.Source)
+            Send-Android "input keyevent $keyCode"
+        }
+    })
     $win.Add_Activated({
         param($sender, $e)
         $w = $script:wrapByWindow[$sender]
@@ -1344,12 +1632,20 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     [void]$script:wrappers.Add($w)
 
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    if ($null -ne $size) { $cw = $size.Width; $ch = $size.Height }
+    if ($null -ne $size) { $cw = [int]$size.Width; $ch = [int]$size.Height }
+    elseif ($app.Package -eq 'com.android.settings') {
+        # Settings is a two-pane 2560x1392 desktop. At full size it would be
+        # wider than most monitors, so show it at a comfortable default width.
+        $cw = [Math]::Min($srcW, 1600)
+        $ch = [int]($cw * $srcH / $srcW)
+    }
     else { $cw = $srcW; $ch = $srcH }
-    $cw = [Math]::Min($cw, $wa.Width - 24)
-    $ch = [Math]::Min($ch, $wa.Height - 64)
+    $maxW = [Math]::Max(360, $wa.Width - 24)
+    $maxH = [Math]::Max(300, $wa.Height - 64 - $script:wrapperNavHeight)
+    if ($cw -gt $maxW) { $k = $maxW / $cw; $cw = [int]($cw * $k); $ch = [int]($ch * $k) }
+    if ($ch -gt $maxH) { $k = $maxH / $ch; $cw = [int]($cw * $k); $ch = [int]($ch * $k) }
     $win.Width = $cw + 16
-    $win.Height = $ch + 39
+    $win.Height = $ch + $script:wrapperNavHeight + 39
     $win.Show()
     $win.UpdateLayout()
     Focus-Wrapper $w
@@ -1362,7 +1658,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         $bw = ($wwr.Right - $wwr.Left) - $wcr.Right
         $bh = ($wwr.Bottom - $wwr.Top) - $wcr.Bottom
         $win.Width = $cw + $bw
-        $win.Height = $ch + $bh
+        $win.Height = $ch + $script:wrapperNavHeight + $bh
     } catch { }
     return $w
 }
@@ -1390,23 +1686,46 @@ $script:frameTimer.Add_Tick({
             if ($i -ge $list.Count) { continue }
             $w = $list[$i]
             if ($w.Closed) { continue }
-            if (-not [NativeWin]::IsWindow($w.Source)) { Remove-Wrapper $w $false; continue }
-            if ([NativeWin]::IsIconic($w.Source)) {
-                [void][NativeWin]::ShowWindow($w.Source, 9)
+            $alive = $false
+            foreach ($pane in @($w.Panes)) {
+                if ($null -ne $pane -and [NativeWin]::IsWindow($pane.Source)) { $alive = $true; break }
             }
-            $sr = New-Object NativeWin+RECT
-            [void][NativeWin]::GetWindowRect($w.Source, [ref]$sr)
-            if ($sr.Left -lt $wa.Right -and $sr.Right -gt $wa.Left -and $sr.Top -lt $wa.Bottom -and $sr.Bottom -gt $wa.Top) {
-                if ([NativeWin]::IsZoomed($w.Source)) { [void][NativeWin]::ShowWindow($w.Source, 9) }
-                [void][NativeWin]::SetWindowPos($w.Source, [IntPtr]::Zero, 3000, 0, $w.SrcW, $w.SrcH, 0x0010)
+            if (-not $alive) { Remove-Wrapper $w $false; continue }
+            $capture = ($w.Window.IsVisible -and $w.Window.WindowState -ne 'Minimized')
+            $lumaSum = 0.0
+            $lumaRows = 0
+            foreach ($pane in @($w.Panes)) {
+                if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
+                if ([NativeWin]::IsIconic($pane.Source)) {
+                    [void][NativeWin]::ShowWindow($pane.Source, 9)
+                }
+                $sr = New-Object NativeWin+RECT
+                [void][NativeWin]::GetWindowRect($pane.Source, [ref]$sr)
+                if ($sr.Left -lt $wa.Right -and $sr.Right -gt $wa.Left -and $sr.Top -lt $wa.Bottom -and $sr.Bottom -gt $wa.Top) {
+                    if ([NativeWin]::IsZoomed($pane.Source)) { [void][NativeWin]::ShowWindow($pane.Source, 9) }
+                    [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $pane.VX, 0, $pane.W, $pane.H, 0x0010)
+                }
+                if (-not $capture) { continue }
+                [void]$pane.Grab.Capture($pane.Source)
+                $rect = [System.Windows.Int32Rect]::new([int]$pane.VX, [int]$pane.VY, [int]$pane.W, [int]$pane.VisH)
+                $bytes = [int]($pane.Grab.Stride * $pane.VisH)
+                $w.Wb.WritePixels($rect, $pane.Grab.Bits, $bytes, $pane.Grab.Stride)
+                $lumaSum += $pane.Grab.MeanLuma() * $pane.VisH
+                $lumaRows += $pane.VisH
             }
-            if (-not $w.Window.IsVisible -or $w.Window.WindowState -eq 'Minimized') { continue }
-            [void]$w.Grab.Capture($w.Source)
-            $w.Wb.WritePixels($w.Rect, $w.Grab.Bits, $w.Grab.ByteSize, $w.Grab.Stride)
+            foreach ($extra in @($w.Parked)) {
+                if ($null -eq $extra -or -not [NativeWin]::IsWindow($extra.Source)) { continue }
+                $er = New-Object NativeWin+RECT
+                [void][NativeWin]::GetWindowRect($extra.Source, [ref]$er)
+                if ($er.Left -lt $wa.Right -and $er.Right -gt $wa.Left -and $er.Top -lt $wa.Bottom -and $er.Bottom -gt $wa.Top) {
+                    [void][NativeWin]::SetWindowPos($extra.Source, [IntPtr]::Zero, $extra.ParkX, $extra.ParkY, $extra.W, $extra.H, 0x0010)
+                }
+            }
+            if (-not $capture -or $lumaRows -eq 0) { continue }
             $w.Frames++
             if (-not $w.Settled -and ($w.Frames % 8) -eq 0) {
                 $elapsed = ([DateTime]::UtcNow - $w.LoadStart).TotalSeconds
-                if ($elapsed -ge 1 -and $w.Grab.MeanLuma() -ge 8) {
+                if ($elapsed -ge 1 -and ($lumaSum / $lumaRows) -ge 8) {
                     $w.Settled = $true
                     $w.Loading.Visibility = 'Collapsed'
                 } elseif ($elapsed -ge 45 -and $w.LoadPhase -lt 2) {
@@ -1452,14 +1771,25 @@ $launchTimer.Add_Tick({
     elseif ($sec -eq 30) { $loaderSub.Text = 'Идёт первый запуск. Android распаковывает данные и транслирует ARM-код — это может занять несколько минут.' }
     elseif ($sec -eq 90) { $loaderSub.Text = 'Всё ещё загружается. Не закрывайте приложение; индикатор можно скрыть.' }
 
-    $h = [NativeWin]::FindWindowContains($st.App.Name, 'Winoid')
+    $h = [NativeWin]::FindWindowContains($st.WindowMatch, 'Winoid')
     if ($h -ne [IntPtr]::Zero) {
         $st.Hwnd = $h
         if (-not $st.Wrapped) {
-            $w = New-AppWrapper $st.App $h $st.Size
-            if ($null -ne $w) {
-                $st.Wrapped = $true
-                Set-Footer "Окно «$($st.App.Name)» открыто."
+            $ready = $true
+            # Settings first paints only the list pane; the detail pane is a
+            # second WSLg window that appears a moment later. Wait for it so
+            # the wrapper is built with the full two-pane desktop.
+            if ($st.App.Package -eq 'com.android.settings' -and $st.SeekTicks -lt 10) {
+                $probe = Get-AppPanes $st.App $h
+                $ready = (@($probe.Panes).Count -ge 2)
+            }
+            $st.SeekTicks++
+            if ($ready) {
+                $w = New-AppWrapper $st.App $h $st.Size
+                if ($null -ne $w) {
+                    $st.Wrapped = $true
+                    Set-Footer "Окно «$(Get-AppDisplayName $st.App)» открыто."
+                }
             }
         }
         if ($st.Wrapped) {
@@ -1489,7 +1819,7 @@ function Start-AppLaunch($app) {
     $existing = Find-WrapperByPackage $app.Package
     if ($null -ne $existing) {
         Focus-Wrapper $existing
-        Set-Footer "Окно «$($app.Name)» уже открыто."
+        Set-Footer "Окно «$(Get-AppDisplayName $app)» уже открыто."
         return
     }
 
@@ -1510,18 +1840,21 @@ function Start-AppLaunch($app) {
     $script:launchState = [pscustomobject]@{
         App = $app
         Ticks = 0
+        SeekTicks = 0
         Hwnd = [IntPtr]::Zero
         Wrapped = $false
         Size = Get-SelectedSize
+        WindowMatch = $(if ($app.Package -eq 'com.android.settings') { 'Settings' } else { $app.Name })
     }
 
-    $loaderTitle.Text = "Запуск: $($app.Name)"
+    $displayName = Get-AppDisplayName $app
+    $loaderTitle.Text = "Запуск: $displayName"
     $loaderSub.Text = 'Открываю приложение в отдельном окне.'
     $loaderElapsed.Text = '0 сек'
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
     $launchTimer.Start()
-    Set-Footer "Запуск $($app.Name)…"
+    Set-Footer "Запуск $displayName…"
 
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $($app.Package)"
     Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
@@ -1973,7 +2306,7 @@ $window.Add_Closing({
     foreach ($w in @($script:wrappers)) {
         Restore-Source $w
         $w.Closed = $true
-        try { $w.Grab.Dispose() } catch { }
+        foreach ($pane in @($w.Panes)) { try { $pane.Grab.Dispose() } catch { } }
         try { $w.Window.Close() } catch { }
     }
     if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
