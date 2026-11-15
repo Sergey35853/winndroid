@@ -407,22 +407,68 @@ $mainXaml = @'
       <Setter Property="BorderBrush" Value="#34363E"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                            Content="{TemplateBinding SelectionBoxItem}"
+                            ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                            ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="Bd" Background="#26282F" BorderBrush="#34363E" BorderThickness="1" CornerRadius="6">
+                      <Grid>
+                        <ContentPresenter Margin="10,0,30,0" VerticalAlignment="Center"/>
+                        <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,11,0"
+                              Data="M 0 0 L 4 4 L 8 0" Stroke="#A9AEBA" StrokeThickness="1.5"/>
+                      </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#4A4D58"/></Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
+                     AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                <Border Background="#26282F" BorderBrush="#34363E" BorderThickness="1" CornerRadius="6"
+                        Margin="0,4,0,0" MinWidth="{TemplateBinding ActualWidth}" MaxHeight="240">
+                  <ScrollViewer>
+                    <ItemsPresenter/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style TargetType="ComboBoxItem">
       <Setter Property="Foreground" Value="#F1F3F5"/>
       <Setter Property="Background" Value="#26282F"/>
       <Setter Property="Padding" Value="8,6"/>
       <Setter Property="HorizontalContentAlignment" Value="Left"/>
-      <Style.Triggers>
-        <Trigger Property="IsHighlighted" Value="True">
-          <Setter Property="Background" Value="#3D7EFF"/>
-          <Setter Property="Foreground" Value="White"/>
-        </Trigger>
-        <Trigger Property="IsSelected" Value="True">
-          <Setter Property="Background" Value="#25314D"/>
-          <Setter Property="Foreground" Value="#F1F3F5"/>
-        </Trigger>
-      </Style.Triggers>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBoxItem">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" CornerRadius="4">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#25314D"/>
+              </Trigger>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#3D7EFF"/>
+                <Setter Property="Foreground" Value="White"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
   </Window.Resources>
 
@@ -492,7 +538,8 @@ $mainXaml = @'
         </DockPanel>
       </Border>
 
-      <StackPanel Grid.Column="1" Margin="16,0,0,0">
+      <ScrollViewer Grid.Column="1" Margin="16,0,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel>
         <Button x:Name="LaunchBtn" Style="{StaticResource Primary}" Content="Запустить в отдельном окне" IsEnabled="False"/>
         <Button x:Name="ShortcutBtn" Content="Ярлык на рабочем столе" IsEnabled="False"/>
         <Button x:Name="DriveBtn" Content="Открыть диск Android"/>
@@ -511,7 +558,8 @@ $mainXaml = @'
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
                    Text="Перетащите APK в окно, чтобы установить. Двойной клик по приложению запускает его в отдельном окне. Кнопка «Ярлык на рабочем столе» создаёт ярлык с родной иконкой приложения. «Настройки Android» открывает системные настройки, «Диск Android» — общую память Android в проводнике, «Перезапустить Android» возвращает окна, если графика WSL зависла. Окно Winoid можно открыть ярлыком на рабочем столе, в меню Пуск или файлом Winoid.cmd."/>
-      </StackPanel>
+        </StackPanel>
+      </ScrollViewer>
     </Grid>
 
     <TextBlock x:Name="FooterText" Grid.Row="2" Margin="2,14,0,0" FontSize="12" Foreground="#A9AEBA" Text="Готово"/>
