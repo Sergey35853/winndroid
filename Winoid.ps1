@@ -283,6 +283,14 @@ $script:sessionTicks = 0
 $script:sessionWaiting = $false
 $script:wslKeepAlive = $null
 $script:msrdcId = 0
+$script:exiting = $false
+$script:pendingLaunch = ''
+$script:pendingLaunchUntil = [DateTime]::MinValue
+$script:pendingAppsAt = [DateTime]::MinValue
+$script:pendingLaunchTries = 0
+$script:lastErrorAt = [DateTime]::MinValue
+$script:lastErrorText = ''
+$script:frameErrorAt = [DateTime]::MinValue
 
 $script:wrappers = New-Object System.Collections.ArrayList
 $script:wrapByImage = @{}
@@ -290,6 +298,7 @@ $script:wrapByWindow = @{}
 $script:bounceWrap = $null
 $script:adb = $null
 $script:adbPath = $null
+$script:adbViaWsl = $false
 $script:adbNextTry = [DateTime]::MinValue
 $script:adbSerial = '192.168.240.112:5555'
 $script:adbCheckedAt = [DateTime]::MinValue
@@ -300,6 +309,7 @@ $script:androidDrive = ''
 $script:androidDriveTarget = ''
 $script:androidDriveMode = ''
 $script:androidDriveAclDone = $false
+$script:staleDrivesCleared = $false
 
 # One-time migration from the old Winndroid data directory.
 function Initialize-WinoidData {
@@ -336,6 +346,13 @@ function Initialize-WinoidData {
             } catch { }
             return $oldRoot
         }
+    }
+    if (-not (Test-Path -LiteralPath $newRoot)) {
+        # If the old folder is still there, migration failed (for example a
+        # file is locked). Keep using it instead of starting from an empty
+        # folder and hiding the user's settings.
+        if (Test-Path -LiteralPath $oldRoot) { return $oldRoot }
+        try { New-Item -ItemType Directory -Path $newRoot -Force -ErrorAction Stop | Out-Null } catch { }
     }
     if (Test-Path -LiteralPath $newRoot) { return $newRoot }
     return $oldRoot
@@ -755,6 +772,55 @@ function Set-Footer([string]$text) {
     $footerText.Text = $text
 }
 
+# --- diagnostics -----------------------------------------------------------
+# A single failed timer or UI callback must never terminate the manager:
+# PowerShell throws into the WPF dispatcher and Windows kills the process.
+function Write-WinoidLog([string]$Text) {
+    try {
+        $path = Join-Path $script:dataRoot 'winoid.log'
+        if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 1048576) {
+            Move-Item -LiteralPath $path -Destination ($path + '.old') -Force -ErrorAction SilentlyContinue
+        }
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::AppendAllText($path, ("{0} {1}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Show-InternalError([string]$Text) {
+    try {
+        $now = Get-Date
+        if ($Text -eq $script:lastErrorText -and ($now - $script:lastErrorAt).TotalSeconds -lt 20) { return }
+        $script:lastErrorText = $Text
+        $script:lastErrorAt = $now
+        Set-Footer "Ошибка: $Text"
+    } catch { }
+}
+
+function Invoke-Safe {
+    param([string]$Where, [scriptblock]$Action)
+    try {
+        & $Action
+    } catch {
+        $ex = $_.Exception
+        Write-WinoidLog ("ERROR {0}: {1}" -f $Where, $ex.ToString())
+        Show-InternalError $ex.Message
+    }
+}
+
+# Last line of defence for exceptions the individual guards miss. Handled
+# dispatcher errors are logged and the app keeps running.
+$window.Dispatcher.Add_UnhandledException({
+    param($sender, $e)
+    try { Write-WinoidLog ("DISPATCHER: " + $e.Exception.ToString()) } catch { }
+    Show-InternalError $e.Exception.Message
+    $e.Handled = $true
+})
+[System.AppDomain]::CurrentDomain.add_UnhandledException({
+    param($sender, $e)
+    try { Write-WinoidLog ("FATAL: " + $e.ExceptionObject.ToString()) } catch { }
+})
+
 function Get-WslBase {
     param([switch]$Root)
     $a = New-Object System.Collections.ArrayList
@@ -839,6 +905,13 @@ function Get-AndroidStorageInfo {
     if ([string]::IsNullOrWhiteSpace($storage)) { return $null }
 
     if ($ApplyAcl) {
+        # The ACL survives restarts. Re-applying it recursively over the whole
+        # /sdcard on every launch froze the manager for tens of seconds, so
+        # first check whether the WSL user can already read the folder.
+        $checkCmd = "test -r '$storage' -a -x '$storage' && printf WINOID_STORAGE_OK"
+        $check = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $checkCmd)) 10000
+        if ($check.Out -match 'WINOID_STORAGE_OK') { return $storage }
+
         $user = Get-WslUserName
         if ([string]::IsNullOrWhiteSpace($user)) { $user = 'winoid' }
         $cmd = "if command -v setfacl >/dev/null 2>&1; then setfacl -R -m u:$user:rwx '$storage' 2>/dev/null; setfacl -R -d -m u:$user:rwx '$storage' 2>/dev/null; else chmod -R o+rwX '$storage' 2>/dev/null; fi; printf %s '$storage'"
@@ -894,8 +967,30 @@ function Remove-DriveMapping([string]$Letter) {
     try { & net.exe use "${Letter}:" /delete /y 2>&1 | Out-Null } catch { }
 }
 
+# A force-killed or crashed manager leaves its DOS-device mapping behind.
+# Over several launches those stale mappings consume every free letter, so
+# remove only mappings that point at Waydroid's media directory.
+function Clear-StaleAndroidDrives {
+    $removed = 0
+    foreach ($code in 65..90) {
+        $letter = [string][char]$code
+        $sb = New-Object System.Text.StringBuilder 1024
+        if ([WinoidDrive]::QueryDosDevice("${letter}:", $sb, 1024) -eq 0) { continue }
+        $target = $sb.ToString()
+        if ($target -notmatch '(?i)waydroid\\data\\media\\0') { continue }
+        Write-WinoidLog "drive cleanup ${letter}: $target"
+        Remove-DriveMapping $letter
+        $removed++
+    }
+    if ($removed -gt 0) { Write-WinoidLog "drive cleanup: removed $removed stale mapping(s)" }
+}
+
 function Mount-AndroidDrive {
     param([switch]$Open)
+    if (-not $script:staleDrivesCleared) {
+        $script:staleDrivesCleared = $true
+        Clear-StaleAndroidDrives
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:androidDrive) -and (Test-Path -LiteralPath "${script:androidDrive}\")) {
         if ($Open) { Start-Process -FilePath 'explorer.exe' -ArgumentList "${script:androidDrive}\" }
         return $true
@@ -997,7 +1092,8 @@ function Start-WslDetached {
     foreach ($a in $Arguments) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    [void][System.Diagnostics.Process]::Start($psi)
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if ($null -ne $p) { $p.Dispose() }
 }
 
 # WSL stops the VM after about a minute without an active wsl.exe client.
@@ -1195,6 +1291,7 @@ function Invoke-AdbCli {
 function Initialize-Adb {
     if ($script:adb -and $script:adb.Running) { return }
     if (-not $script:adbPath) { $script:adbPath = Find-AdbExe }
+    $script:adbViaWsl = $false
 
     # Prefer the WSL-side adb server: it sees the Waydroid container even
     # when a Windows VPN blackholes 192.168.240.0/24.
@@ -1206,7 +1303,10 @@ function Initialize-Adb {
         $prefix = New-Object System.Collections.ArrayList
         if (-not [string]::IsNullOrWhiteSpace($script:wslDistro)) { [void]$prefix.Add('-d'); [void]$prefix.Add($script:wslDistro) }
         [void]$prefix.Add('--'); [void]$prefix.Add('adb')
-        try { $script:adb = [AdbShell]::new($script:wsl, $script:adbSerial, [string[]]$prefix) } catch { $script:adb = $null }
+        try {
+            $script:adb = [AdbShell]::new($script:wsl, $script:adbSerial, [string[]]$prefix)
+            $script:adbViaWsl = $true
+        } catch { $script:adb = $null }
         return
     }
 
@@ -1597,34 +1697,40 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     })
     $win.Add_PreviewKeyDown({
         param($sender, $e)
-        $w = $script:wrapByWindow[$sender]
-        if ($null -eq $w -or $w.Closed) { return }
-        $key = $e.Key.ToString()
-        if ($key -eq 'System') { $key = $e.SystemKey.ToString() }
-        $alt = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Alt) -ne 0)
-        $keyCode = 0
-        if ($key -eq 'Escape' -or $key -eq 'Back' -or $key -eq 'BrowserBack' -or ($key -eq 'Left' -and $alt)) { $keyCode = 4 }
-        elseif ($key -eq 'Home') { $keyCode = 3 }
-        elseif ($key -eq 'Apps' -or $key -eq 'LaunchApplication1') { $keyCode = 187 }
-        if ($keyCode -ne 0) {
-            $e.Handled = $true
-            [NativeWin]::ForceForeground($w.Source)
-            Send-Android "input keyevent $keyCode"
+        Invoke-Safe 'wrapper.key' {
+            $w = $script:wrapByWindow[$sender]
+            if ($null -eq $w -or $w.Closed) { return }
+            $key = $e.Key.ToString()
+            if ($key -eq 'System') { $key = $e.SystemKey.ToString() }
+            $alt = (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Alt) -ne 0)
+            $keyCode = 0
+            if ($key -eq 'Escape' -or $key -eq 'Back' -or $key -eq 'BrowserBack' -or ($key -eq 'Left' -and $alt)) { $keyCode = 4 }
+            elseif ($key -eq 'Home') { $keyCode = 3 }
+            elseif ($key -eq 'Apps' -or $key -eq 'LaunchApplication1') { $keyCode = 187 }
+            if ($keyCode -ne 0) {
+                $e.Handled = $true
+                [NativeWin]::ForceForeground($w.Source)
+                Send-Android "input keyevent $keyCode"
+            }
         }
     })
     $win.Add_Activated({
         param($sender, $e)
-        $w = $script:wrapByWindow[$sender]
-        if ($null -eq $w -or $w.Closed) { return }
-        $script:bounceWrap = $w
-        $script:bounceTimer.Stop()
-        $script:bounceTimer.Start()
+        Invoke-Safe 'wrapper.activated' {
+            $w = $script:wrapByWindow[$sender]
+            if ($null -eq $w -or $w.Closed) { return }
+            $script:bounceWrap = $w
+            $script:bounceTimer.Stop()
+            $script:bounceTimer.Start()
+        }
     })
     $win.Add_Closing({
         param($sender, $e)
-        $w = $script:wrapByWindow[$sender]
-        if ($null -eq $w -or $w.Closed) { return }
-        Remove-Wrapper $w $true
+        Invoke-Safe 'wrapper.closing' {
+            $w = $script:wrapByWindow[$sender]
+            if ($null -eq $w -or $w.Closed) { return }
+            Remove-Wrapper $w $true
+        }
     })
 
     $script:wrapByImage[$image] = $w
@@ -1673,7 +1779,9 @@ $script:bounceTimer.Add_Tick({
         if ($w.Window.IsActive -and $w.Window.WindowState -ne 'Minimized' -and [System.Windows.Input.Mouse]::LeftButton -eq 'Released') {
             [NativeWin]::ForceForeground($w.Source)
         }
-    } catch { }
+    } catch {
+        Write-WinoidLog ("ERROR bounceTimer: " + $_.Exception.ToString())
+    }
 })
 
 $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
@@ -1754,12 +1862,19 @@ $script:frameTimer.Add_Tick({
                 $script:msrdcId = $msrdc[0].Id
             }
         }
-    } catch { }
+    } catch {
+        $now = Get-Date
+        if (($now - $script:frameErrorAt).TotalSeconds -ge 30) {
+            $script:frameErrorAt = $now
+            Write-WinoidLog ("ERROR frameTimer: " + $_.Exception.ToString())
+        }
+    }
 })
 
 $launchTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $launchTimer.Interval = [TimeSpan]::FromSeconds(1)
 $launchTimer.Add_Tick({
+    Invoke-Safe 'launchTimer' {
     if (-not $script:launchState) { $launchTimer.Stop(); return }
     $st = $script:launchState
     $st.Ticks++
@@ -1807,6 +1922,7 @@ $launchTimer.Add_Tick({
         $launchTimer.Stop()
         Set-Footer 'Окно не появилось за 15 минут. Проверьте состояние Android.'
     }
+    }
 })
 
 function Start-AppLaunch($app) {
@@ -1816,10 +1932,20 @@ function Start-AppLaunch($app) {
         Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return
     }
+    if (-not $script:sessionRunning) {
+        Set-PendingLaunch $app.Package
+        if (-not $sessionTimer.IsEnabled) { Start-Session }
+        return
+    }
     $existing = Find-WrapperByPackage $app.Package
     if ($null -ne $existing) {
         Focus-Wrapper $existing
         Set-Footer "Окно «$(Get-AppDisplayName $app)» уже открыто."
+        return
+    }
+    if ($null -ne $script:launchState -and -not $script:launchState.Wrapped -and $script:launchState.App.Package -eq $app.Package) {
+        $loader.Show()
+        Set-Footer "«$(Get-AppDisplayName $app)» уже запускается…"
         return
     }
 
@@ -1857,38 +1983,81 @@ function Start-AppLaunch($app) {
     Set-Footer "Запуск $displayName…"
 
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $($app.Package)"
-    Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
+    try {
+        Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
+    } catch {
+        Write-WinoidLog ("ERROR launch " + $app.Package + ": " + $_.Exception.ToString())
+        $launchTimer.Stop()
+        $script:launchState = $null
+        $loader.Hide()
+        Set-Footer "Не удалось отправить запуск в Android: $($_.Exception.Message)"
+    }
 }
 
 $installTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $installTimer.Interval = [TimeSpan]::FromSeconds(1)
 $installTimer.Add_Tick({
+    Invoke-Safe 'installTimer' {
+    if ($null -eq $script:installJob) { $installTimer.Stop(); $loader.Hide(); return }
     $script:installTicks++
     $sec = $script:installTicks
     if ($sec -lt 60) { $loaderElapsed.Text = "$sec сек" } else { $loaderElapsed.Text = ('{0}:{1:00}' -f [int]($sec / 60), ($sec % 60)) }
-    if ($null -eq $script:installJob) { $installTimer.Stop(); return }
-    if ($script:installJob.State -in @('Completed', 'Failed', 'Stopped')) {
-        $out = @(Receive-Job -Job $script:installJob -ErrorAction SilentlyContinue) | Out-String
+    $state = 'Unknown'
+    try { $state = [string]$script:installJob.State } catch { }
+    if ($state -in @('Completed', 'Failed', 'Stopped')) {
+        $out = ''
+        try { $out = @(Receive-Job -Job $script:installJob -ErrorAction SilentlyContinue) | Out-String } catch { }
+        Write-WinoidLog "install job $state`: $out"
         Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue
         $script:installJob = $null
         $installTimer.Stop()
         $loader.Hide()
-        Refresh-Apps
+        Invoke-Safe 'install.refresh' { Refresh-Apps }
         $last = (($out -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 -and $_ -notmatch '^WINOID_INSTALL_EXIT=' } | Select-Object -Last 1)
         if ($out -match 'WINOID_INSTALL_EXIT=0') { Set-Footer 'APK установлен.' }
         elseif ($last) { Set-Footer "Установка не удалась: $last" }
         else { Set-Footer 'Установка не удалась. Подробности: %LOCALAPPDATA%\Winoid\install.log' }
     }
+    }
 })
 
 function Install-Apk([string]$path) {
     if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { return }
-    $apk = (Resolve-Path -LiteralPath $path).Path
-    Initialize-Adb
-    if (-not $script:adbPath) {
-        Set-Footer 'ADB не найден. Установите platform-tools или положите adb.exe рядом с Winoid.ps1.'
+    if ($null -ne $script:installJob) {
+        $state = 'Unknown'
+        try { $state = [string]$script:installJob.State } catch { }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+            Set-Footer 'Установка уже идёт. Дождитесь её окончания.'
+            return
+        }
+        Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue
+        $script:installJob = $null
+    }
+    if ($null -ne $script:sessionJob -and $sessionTimer.IsEnabled) {
+        Set-Footer 'Дождитесь запуска Android, затем повторите установку.'
         return
     }
+
+    $apk = (Resolve-Path -LiteralPath $path).Path
+    Invoke-Safe 'install.initAdb' { Initialize-Adb }
+
+    # Prefer WSL adb for the same reason as input: the Windows route to the
+    # Waydroid subnet may be blackholed by a VPN. Windows adb is the fallback.
+    $mode = ''
+    $exe = ''
+    $apkArg = $apk
+    if ($script:adbViaWsl -and $null -ne $script:adb -and $script:adb.Running) {
+        $mode = 'wsl'
+        $exe = $script:wsl
+        $apkArg = ConvertTo-WslPath $apk
+    } elseif (-not [string]::IsNullOrWhiteSpace($script:adbPath)) {
+        $mode = 'local'
+        $exe = $script:adbPath
+    } else {
+        Set-Footer 'ADB не найден. Установите platform-tools или настройте Android заново.'
+        return
+    }
+    Write-WinoidLog "install start ($mode): $apk"
 
     $script:installTicks = 0
     $loaderTitle.Text = 'Установка APK'
@@ -1898,23 +2067,40 @@ function Install-Apk([string]$path) {
     $loaderBar.IsIndeterminate = $true
     Set-Footer 'Установка APK…'
 
-    $jobAdb = $script:adbPath
+    $jobExe = $exe
+    $jobDistro = $script:wslDistro
     $jobSerial = $script:adbSerial
-    $script:installJob = Start-Job -ScriptBlock {
-        param($adbExe, $serial, $apkPath)
-        $lines = New-Object System.Collections.ArrayList
-        $out = & $adbExe -s $serial install -r $apkPath 2>&1
-        $code = $LASTEXITCODE
-        foreach ($l in @($out)) { [void]$lines.Add([string]$l) }
-        [void]$lines.Add("install exit=$code")
-        try {
-            $logRoot = $script:dataRoot
-            if (-not (Test-Path -LiteralPath $logRoot)) { New-Item -ItemType Directory -Path $logRoot -Force | Out-Null }
-            Add-Content -LiteralPath (Join-Path $logRoot 'install.log') -Value (($lines -join "`r`n") + "`r`nWINOID_INSTALL_EXIT=$code") -Encoding UTF8
-        } catch { }
-        foreach ($l in $lines) { $l }
-        "WINOID_INSTALL_EXIT=$code"
-    } -ArgumentList $jobAdb, $jobSerial, $apk
+    $jobLog = Join-Path $script:dataRoot 'install.log'
+    try {
+        $script:installJob = Start-Job -ScriptBlock {
+            param($mode, $exe, $distro, $serial, $apkPath, $logFile)
+            $lines = New-Object System.Collections.ArrayList
+            [void]$lines.Add("mode=$mode")
+            if ($mode -eq 'wsl') {
+                $wslArgs = @()
+                if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
+                $out = & $exe @wslArgs -- adb -s $serial install -r $apkPath 2>&1
+            } else {
+                $out = & $exe -s $serial install -r $apkPath 2>&1
+            }
+            $code = $LASTEXITCODE
+            foreach ($l in @($out)) { [void]$lines.Add([string]$l) }
+            [void]$lines.Add("install exit=$code")
+            try {
+                $dir = Split-Path -Parent $logFile
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                [System.IO.File]::WriteAllText($logFile, (($lines -join "`r`n") + "`r`nWINOID_INSTALL_EXIT=$code"), (New-Object System.Text.UTF8Encoding($false)))
+            } catch { }
+            foreach ($l in $lines) { $l }
+            "WINOID_INSTALL_EXIT=$code"
+        } -ArgumentList $mode, $jobExe, $jobDistro, $jobSerial, $apkArg, $jobLog
+    } catch {
+        Write-WinoidLog ("ERROR install job: " + $_.Exception.ToString())
+        $script:installJob = $null
+        $loader.Hide()
+        Set-Footer "Не удалось запустить установку: $($_.Exception.Message)"
+        return
+    }
     $installTimer.Start()
 }
 
@@ -2106,6 +2292,46 @@ function New-AppShortcut($app) {
     Update-AppShortcutIconAsync $app $lnk
 }
 
+function Set-PendingLaunch([string]$target) {
+    if ([string]::IsNullOrWhiteSpace($target)) { return }
+    $script:pendingLaunch = $target
+    $script:pendingLaunchTries = 0
+    $script:pendingLaunchUntil = (Get-Date).AddMinutes(5)
+    $script:pendingAppsAt = (Get-Date).AddSeconds(2)
+    Set-Footer "Жду Android, чтобы открыть $target…"
+}
+
+# A shortcut can start Winoid while Android/Waydroid is still booting. Keep
+# the request until the app list appears instead of dropping it on the floor.
+function Try-PendingLaunch {
+    if ([string]::IsNullOrWhiteSpace($script:pendingLaunch)) { return }
+    if ((Get-Date) -gt $script:pendingLaunchUntil) {
+        $target = $script:pendingLaunch
+        $script:pendingLaunch = ''
+        Write-WinoidLog "pending launch expired: $target"
+        Set-Footer "Не удалось открыть ${target}: Android не показал приложение за 5 минут."
+        return
+    }
+    if (-not $script:sessionRunning) { return }
+    if ($null -ne $script:launchState -and -not $script:launchState.Wrapped) { return }
+
+    $target = $script:pendingLaunch
+    $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
+    if ($null -eq $app) {
+        # The package list can be incomplete for a while on a cold boot. Keep
+        # refreshing until the deadline instead of giving up after a few tries.
+        if ((Get-Date) -ge $script:pendingAppsAt) {
+            $script:pendingAppsAt = (Get-Date).AddSeconds(5)
+            $script:pendingLaunchTries++
+            Invoke-Safe 'pending.refresh' { Refresh-Apps }
+        }
+        return
+    }
+    $script:pendingLaunch = ''
+    Write-WinoidLog "pending launch: $target (after $($script:pendingLaunchTries) refresh(es))"
+    Start-AppLaunch $app
+}
+
 function Process-Requests {
     if (-not (Test-Path -LiteralPath $script:requestDir)) { return }
     $files = @(Get-ChildItem -LiteralPath $script:requestDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTime)
@@ -2116,44 +2342,60 @@ function Process-Requests {
         if ($null -eq $req) { continue }
         if (((Get-Date) - $file.CreationTime).TotalMinutes -gt 10) { continue }
 
-        $target = [string]$req.target
-        if ($req.action -eq 'install') {
-            if ($target -and (Test-Path -LiteralPath $target)) { Install-Apk $target }
-            else { Set-Footer 'Ярлык: APK-файл не найден.' }
-            continue
-        }
+        try {
+            $target = [string]$req.target
+            if ($req.action -eq 'install') {
+                if ($target -and (Test-Path -LiteralPath $target)) { Install-Apk $target }
+                else { Set-Footer 'Ярлык: APK-файл не найден.' }
+                continue
+            }
 
-        $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
-        if (-not $app) {
-            Refresh-Apps
             $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
+            if (-not $app) {
+                Refresh-Apps
+                $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
+            }
+            if ($app) { Start-AppLaunch $app }
+            elseif ($target) { Set-PendingLaunch $target }
+        } catch {
+            Write-WinoidLog ("ERROR request {0}: {1}" -f $file.Name, $_.Exception.ToString())
+            Show-InternalError $_.Exception.Message
         }
-        if ($app) { Start-AppLaunch $app }
-        elseif ($target) { Set-Footer "Ярлык: приложение $target не найдено в Android." }
     }
 }
 
 $requestTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $requestTimer.Interval = [TimeSpan]::FromSeconds(1)
-$requestTimer.Add_Tick({ Process-Requests })
+$requestTimer.Add_Tick({ Invoke-Safe 'requestTimer' { Process-Requests; Try-PendingLaunch } })
 
 $driveTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $driveTimer.Interval = [TimeSpan]::FromSeconds(2)
 $driveTimer.Add_Tick({
-    $driveTimer.Stop()
-    Mount-AndroidDrive | Out-Null
+    Invoke-Safe 'driveTimer' {
+        $driveTimer.Stop()
+        Mount-AndroidDrive | Out-Null
+    }
 })
 
 $sessionTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $sessionTimer.Interval = [TimeSpan]::FromSeconds(2)
 $sessionTimer.Add_Tick({
+    Invoke-Safe 'sessionTimer' {
     $script:sessionTicks += 2
     $loaderElapsed.Text = "$($script:sessionTicks) сек"
 
     if (-not $script:sessionWaiting) {
-        $state = $script:sessionJob.State
+        if ($null -eq $script:sessionJob) {
+            $script:sessionWaiting = $true
+            $loaderSub.Text = 'Android загружается…'
+            return
+        }
+        $state = 'Unknown'
+        try { $state = [string]$script:sessionJob.State } catch { }
         if ($state -in @('Completed', 'Failed', 'Stopped')) {
-            Receive-Job -Job $script:sessionJob -ErrorAction SilentlyContinue | Out-Null
+            $out = ''
+            try { $out = @(Receive-Job -Job $script:sessionJob -ErrorAction SilentlyContinue) | Out-String } catch { }
+            Write-WinoidLog "session job $state`: $out"
             Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue
             $script:sessionJob = $null
             $script:sessionWaiting = $true
@@ -2174,11 +2416,23 @@ $sessionTimer.Add_Tick({
             $script:pendingAndroidWindow = $null
             Start-AndroidWindow $pending.Package $pending.Title
         }
+        if ($script:pendingLaunch) {
+            # Give a shortcut request a fresh window once Android is really up:
+            # booting can consume most of the original deadline.
+            $script:pendingLaunchUntil = (Get-Date).AddMinutes(3)
+            $script:pendingAppsAt = (Get-Date).AddSeconds(1)
+        }
+        Try-PendingLaunch
     } elseif ($script:sessionTicks -ge 90) {
         $sessionTimer.Stop()
         $loader.Hide()
         Test-Session | Out-Null
+        if ($script:pendingLaunch) {
+            Write-WinoidLog "pending launch cancelled: Android did not start"
+            $script:pendingLaunch = ''
+        }
         Set-Footer 'Android не запустился за 90 секунд. Проверьте журнал Waydroid.'
+    }
     }
 })
 
@@ -2202,8 +2456,13 @@ function Start-AndroidWindow([string]$package, [string]$title) {
         return
     }
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $package"
-    Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
-    Set-Footer "Открываю $title…"
+    try {
+        Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
+        Set-Footer "Открываю $title…"
+    } catch {
+        Write-WinoidLog ("ERROR open " + $package + ": " + $_.Exception.ToString())
+        Set-Footer "Не удалось открыть $title`: $($_.Exception.Message)"
+    }
 }
 
 function Start-Session {
@@ -2213,6 +2472,22 @@ function Start-Session {
         Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return
     }
+    if ($null -ne $script:installJob -and $installTimer.IsEnabled) {
+        Set-Footer 'Сначала дождитесь окончания установки APK.'
+        return
+    }
+    if ($null -ne $script:sessionJob) {
+        $state = 'Unknown'
+        try { $state = [string]$script:sessionJob.State } catch { }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+            $loader.Show()
+            Set-Footer 'Android уже запускается…'
+            return
+        }
+        Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue
+        $script:sessionJob = $null
+    }
+    $script:sessionRunning = $false
     $script:sessionTicks = 0
     $script:sessionWaiting = $false
     $loaderTitle.Text = $(if ($Restart) { 'Перезапуск Android' } else { 'Запуск Android' })
@@ -2224,114 +2499,167 @@ function Start-Session {
     $jobWsl = $script:wsl
     $jobDistro = $script:wslDistro
     $action = $(if ($Restart) { 'restart' } else { 'start' })
-    $script:sessionJob = Start-Job -ScriptBlock {
-        param($wslExe, $distro, $verb)
-        $wslArgs = @()
-        if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
-        & $wslExe @wslArgs -- bash -lc "systemctl --user $verb waydroid-session.service" 2>&1
-    } -ArgumentList $jobWsl, $jobDistro, $action
+    try {
+        $script:sessionJob = Start-Job -ScriptBlock {
+            param($wslExe, $distro, $verb)
+            $wslArgs = @()
+            if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
+            & $wslExe @wslArgs -- bash -lc "systemctl --user $verb waydroid-session.service" 2>&1
+        } -ArgumentList $jobWsl, $jobDistro, $action
+    } catch {
+        Write-WinoidLog ("ERROR session start: " + $_.Exception.ToString())
+        $script:sessionJob = $null
+        $loader.Hide()
+        Set-Footer "Не удалось запустить Android: $($_.Exception.Message)"
+        return
+    }
     $sessionTimer.Start()
 }
 
 # --- events ---
 
-$searchBox.Add_TextChanged({ Update-AppFilter })
+$searchBox.Add_TextChanged({ Invoke-Safe 'filter' { Update-AppFilter } })
 $refreshBtn.Add_Click({
-    Test-Session | Out-Null
-    Refresh-Apps
+    Invoke-Safe 'refresh' {
+        Test-Session | Out-Null
+        Refresh-Apps
+    }
 })
 $appsList.Add_SelectionChanged({
-    $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
-    $shortcutBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+    Invoke-Safe 'selection' {
+        $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+        $shortcutBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+    }
 })
 $appsList.Add_MouseDoubleClick({
-    if ($null -ne $appsList.SelectedItem) { Start-AppLaunch $appsList.SelectedItem }
+    Invoke-Safe 'doubleClick' {
+        if ($null -ne $appsList.SelectedItem) { Start-AppLaunch $appsList.SelectedItem }
+    }
 })
-$launchBtn.Add_Click({ Start-AppLaunch $appsList.SelectedItem })
-$shortcutBtn.Add_Click({ New-AppShortcut $appsList.SelectedItem })
-$driveBtn.Add_Click({ Mount-AndroidDrive -Open | Out-Null })
+$launchBtn.Add_Click({ Invoke-Safe 'launchBtn' { Start-AppLaunch $appsList.SelectedItem } })
+$shortcutBtn.Add_Click({ Invoke-Safe 'shortcutBtn' { New-AppShortcut $appsList.SelectedItem } })
+$driveBtn.Add_Click({ Invoke-Safe 'driveBtn' { Mount-AndroidDrive -Open | Out-Null } })
 $installBtn.Add_Click({
-    $dlg = [Microsoft.Win32.OpenFileDialog]::new()
-    $dlg.Title = 'Выберите APK'
-    $dlg.Filter = 'Android package (*.apk)|*.apk|Все файлы (*.*)|*.*'
-    if ($dlg.ShowDialog($window) -eq $true) { Install-Apk $dlg.FileName }
+    Invoke-Safe 'installBtn' {
+        $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+        $dlg.Title = 'Выберите APK'
+        $dlg.Filter = 'Android package (*.apk)|*.apk|Все файлы (*.*)|*.*'
+        if ($dlg.ShowDialog($window) -eq $true) { Install-Apk $dlg.FileName }
+    }
 })
 $backendBtn.Add_Click({
-    $setup = Join-Path $script:baseDir 'Setup-Backend.ps1'
-    if (-not (Test-Path -LiteralPath $setup)) { $setup = Join-Path $script:baseDir 'installer\Setup-Backend.ps1' }
-    if (Test-Path -LiteralPath $setup) {
-        Start-Process -FilePath 'pwsh.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$setup`"" -WorkingDirectory $script:baseDir
-        Set-Footer 'Открыл настройку Android в отдельном окне.'
-    } else {
-        Start-Process 'https://github.com/Sergey35853/winoid/blob/main/README.md#как-поднять-бэкенд'
-        Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
+    Invoke-Safe 'backendBtn' {
+        $setup = Join-Path $script:baseDir 'Setup-Backend.ps1'
+        if (-not (Test-Path -LiteralPath $setup)) { $setup = Join-Path $script:baseDir 'installer\Setup-Backend.ps1' }
+        if (Test-Path -LiteralPath $setup) {
+            Start-Process -FilePath 'pwsh.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$setup`"" -WorkingDirectory $script:baseDir
+            Set-Footer 'Открыл настройку Android в отдельном окне.'
+        } else {
+            Start-Process 'https://github.com/Sergey35853/winoid/blob/main/README.md#как-поднять-бэкенд'
+            Set-Footer 'Открыл инструкцию по настройке бэкенда в браузере.'
+        }
     }
 })
-$fullUiBtn.Add_Click({
-    Start-Session -Restart
-})
-$settingsBtn.Add_Click({
-    Start-AndroidWindow 'com.android.settings' 'Настройки Android'
-})
+$fullUiBtn.Add_Click({ Invoke-Safe 'restart' { Start-Session -Restart } })
+$settingsBtn.Add_Click({ Invoke-Safe 'settingsBtn' { Start-AndroidWindow 'com.android.settings' 'Настройки Android' } })
 $showWindowBtn.Add_Click({
-    if ($script:launchState) {
-        $w = Find-WrapperByPackage $script:launchState.App.Package
-        if ($null -ne $w) { Focus-Wrapper $w }
+    Invoke-Safe 'showWindowBtn' {
+        if ($script:launchState) {
+            $w = Find-WrapperByPackage $script:launchState.App.Package
+            if ($null -ne $w) { Focus-Wrapper $w }
+        }
+        $loader.Hide()
     }
-    $loader.Hide()
 })
 $hideLoaderBtn.Add_Click({
-    $loader.Hide()
-    $launchTimer.Stop()
-    Set-Footer 'Индикатор скрыт. Приложение продолжает запускаться.'
+    Invoke-Safe 'hideLoaderBtn' {
+        $loader.Hide()
+        $launchTimer.Stop()
+        Set-Footer 'Индикатор скрыт. Приложение продолжает запускаться.'
+    }
 })
 $window.Add_Drop({
     param($sender, $e)
-    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
-        $files = $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
-        foreach ($f in $files) {
-            if ($f -like '*.apk') { Install-Apk $f; break }
+    Invoke-Safe 'drop' {
+        if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+            $files = $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
+            foreach ($f in $files) {
+                if ($f -like '*.apk') { Install-Apk $f; break }
+            }
         }
     }
 })
 $window.Add_Closing({
-    $launchTimer.Stop()
-    $installTimer.Stop()
-    $sessionTimer.Stop()
-    $requestTimer.Stop()
-    $driveTimer.Stop()
-    try { Disconnect-AndroidDrive } catch { }
-    $script:frameTimer.Stop()
-    $script:bounceTimer.Stop()
+    $script:exiting = $true
+    Invoke-Safe 'closing.timers' {
+        $launchTimer.Stop()
+        $installTimer.Stop()
+        $sessionTimer.Stop()
+        $requestTimer.Stop()
+        $driveTimer.Stop()
+        $script:frameTimer.Stop()
+        $script:bounceTimer.Stop()
+    }
+    Invoke-Safe 'closing.drive' { Disconnect-AndroidDrive }
     foreach ($w in @($script:wrappers)) {
-        Restore-Source $w
-        $w.Closed = $true
-        foreach ($pane in @($w.Panes)) { try { $pane.Grab.Dispose() } catch { } }
-        try { $w.Window.Close() } catch { }
+        Invoke-Safe 'closing.wrapper' {
+            Restore-Source $w
+            $w.Closed = $true
+            foreach ($pane in @($w.Panes)) { try { $pane.Grab.Dispose() } catch { } }
+            try { $w.Window.Close() } catch { }
+        }
     }
-    if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
-    if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
-    if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
-    if ($script:wslKeepAlive) {
-        try { if (-not $script:wslKeepAlive.HasExited) { $script:wslKeepAlive.Kill() } } catch { }
-        try { $script:wslKeepAlive.Dispose() } catch { }
-        $script:wslKeepAlive = $null
+    Invoke-Safe 'closing.adb' {
+        if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
+    }
+    Invoke-Safe 'closing.jobs' {
+        if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
+        if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
+        if ($script:wslKeepAlive) {
+            try { if (-not $script:wslKeepAlive.HasExited) { $script:wslKeepAlive.Kill() } } catch { }
+            try { $script:wslKeepAlive.Dispose() } catch { }
+            $script:wslKeepAlive = $null
+        }
+    }
+    try { $loader.Close() } catch { }
+})
+$window.Add_Closed({
+    Invoke-Safe 'closed' {
+        $script:exiting = $true
+        $window.Dispatcher.InvokeShutdown()
     }
 })
-$window.Add_Closed({ [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() })
 $window.Add_Loaded({
-    Start-WslKeepAlive
-    if (-not (Test-Session)) { Start-Session }
-    Refresh-Apps
-    Initialize-Adb
-    $driveTimer.Start()
-    if ($Install) { Install-Apk $Install }
+    Invoke-Safe 'loaded.keepalive' { Start-WslKeepAlive }
+    Invoke-Safe 'loaded.session' { if (-not (Test-Session)) { Start-Session } }
+    # When Android is still booting, Refresh-Apps and Initialize-Adb would
+    # block the UI thread for tens of seconds before the session timer gets a
+    # chance to run. The timer repeats this work as soon as Waydroid is up.
+    if ($script:sessionRunning) {
+        Invoke-Safe 'loaded.apps' { Refresh-Apps }
+        Invoke-Safe 'loaded.adb' { Initialize-Adb }
+    }
+    Invoke-Safe 'loaded.drive' { $driveTimer.Start() }
+    if ($Install) {
+        Invoke-Safe 'loaded.install' {
+            if (Test-Path -LiteralPath $Install) { Install-Apk $Install }
+            else { Set-Footer "APK не найден: $Install" }
+        }
+    }
     if ($Launch) {
-        $app = $script:apps | Where-Object { $_.Package -eq $Launch -or $_.Name -eq $Launch } | Select-Object -First 1
-        if ($app) { Start-AppLaunch $app }
+        Invoke-Safe 'loaded.launch' {
+            $app = $script:apps | Where-Object { $_.Package -eq $Launch -or $_.Name -eq $Launch } | Select-Object -First 1
+            if ($app) { Start-AppLaunch $app } else { Set-PendingLaunch $Launch }
+        }
     }
 })
-$loader.Add_Closing({ $_.Cancel = $true; $loader.Hide() })
+$loader.Add_Closing({
+    param($sender, $e)
+    if (-not $script:exiting) {
+        $e.Cancel = $true
+        $loader.Hide()
+    }
+})
 
 $script:frameTimer.Start()
 $requestTimer.Start()
