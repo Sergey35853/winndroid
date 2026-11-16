@@ -310,6 +310,11 @@ $script:androidDriveTarget = ''
 $script:androidDriveMode = ''
 $script:androidDriveAclDone = $false
 $script:staleDrivesCleared = $false
+$script:armCompat = $false
+$script:armCompatApplied = $null
+$script:armCompatDirty = $false
+$script:armCompatNextTry = [DateTime]::MinValue
+$script:armCompatRestarted = @{}
 
 # One-time migration from the old Winndroid data directory.
 function Initialize-WinoidData {
@@ -368,10 +373,32 @@ if (Test-Path -LiteralPath $script:configPath) {
         $cfg = Get-Content -LiteralPath $script:configPath -Raw | ConvertFrom-Json
         if ($cfg.wslDistro) { $script:wslDistro = [string]$cfg.wslDistro }
         if ($cfg.adbSerial) { $script:adbSerial = [string]$cfg.adbSerial }
+        if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
+            $script:armCompat = [bool]$cfg.armCompat
+        }
     } catch { }
 }
 if ($env:WINOID_WSL_DISTRO) { $script:wslDistro = $env:WINOID_WSL_DISTRO }
 if ($env:WINOID_ADB_SERIAL) { $script:adbSerial = $env:WINOID_ADB_SERIAL }
+
+# Keep the user's existing config keys; only add or update armCompat.
+function Save-ArmCompatSetting {
+    try {
+        $cfg = $null
+        if (Test-Path -LiteralPath $script:configPath) {
+            try { $cfg = Get-Content -LiteralPath $script:configPath -Raw | ConvertFrom-Json } catch { }
+        }
+        if ($null -eq $cfg) { $cfg = [pscustomobject]@{} }
+        if ($cfg.PSObject.Properties.Name -contains 'armCompat') {
+            $cfg.armCompat = [bool]$script:armCompat
+        } else {
+            $cfg | Add-Member -NotePropertyName armCompat -NotePropertyValue ([bool]$script:armCompat)
+        }
+        $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
+    } catch {
+        Write-WinoidLog ("ERROR save config: " + $_.Exception.ToString())
+    }
+}
 
 $mainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -603,6 +630,8 @@ $mainXaml = @'
           <ComboBoxItem Content="1920 × 1080"/>
         </ComboBox>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
+        <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
+        <TextBlock Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
                    Text="Перетащите APK в окно, чтобы установить. Двойной клик по приложению запускает его в отдельном окне. Кнопка «Ярлык на рабочем столе» создаёт ярлык с родной иконкой приложения. «Настройки Android» открывает системные настройки, «Диск Android» — общую память Android в проводнике, «Перезапустить Android» возвращает окна, если графика WSL зависла. Окно Winoid можно открыть ярлыком на рабочем столе, в меню Пуск или файлом Winoid.cmd."/>
         </StackPanel>
@@ -754,6 +783,8 @@ $installBtn    = $window.FindName('InstallBtn')
 $backendBtn    = $window.FindName('BackendBtn')
 $sizeBox       = $window.FindName('SizeBox')
 $autoHideCheck = $window.FindName('AutoHideCheck')
+$armCompatCheck = $window.FindName('ArmCompatCheck')
+$armCompatCheck.IsChecked = [bool]$script:armCompat
 $footerText    = $window.FindName('FooterText')
 
 $loaderTitle   = $loader.FindName('LoaderTitle')
@@ -881,6 +912,66 @@ function Get-WslHome {
         $script:wslHome = $r.Out.Trim()
     }
     return $script:wslHome
+}
+
+# libndk's default "two-gear" translator runs a heavy optimizer on hot ARM
+# code. On some ARM64 games that optimizer never finishes (Waydroid issue
+# #2446): the process spins at 100% CPU and the window stays black. libndk's
+# lighter mode skips it, which is slower but gets such games running.
+# The property only affects processes started after it is set.
+function Set-ArmCompatMode([bool]$Enabled) {
+    $mode = $(if ($Enabled) { 'light-translate-or-interpret' } else { 'two-gear' })
+    $cmd = "lxc-unfreeze -P /var/lib/waydroid/lxc -n waydroid >/dev/null 2>&1; " +
+        "echo WINOID_MODE_BEFORE_BEGIN; lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- getprop ndk_translation.mode 2>/dev/null; " +
+        "echo WINOID_MODE_BEFORE_END; " +
+        "lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- setprop ndk_translation.mode $mode 2>/dev/null; " +
+        "echo WINOID_MODE_AFTER_BEGIN; lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- getprop ndk_translation.mode 2>/dev/null; " +
+        "echo WINOID_MODE_AFTER_END"
+    $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'bash', '-lc', $cmd)) 15000
+    $text = (($r.Out + "`n" + $r.Err) -replace "`0", '')
+    $before = ''
+    $after = ''
+    if ($text -match '(?s)WINOID_MODE_BEFORE_BEGIN\s*(.*?)\s*WINOID_MODE_BEFORE_END') { $before = $matches[1].Trim() }
+    if ($text -match '(?s)WINOID_MODE_AFTER_BEGIN\s*(.*?)\s*WINOID_MODE_AFTER_END') { $after = $matches[1].Trim() }
+    if ($r.Code -eq 0 -and $after -eq $mode) {
+        if ($before -ne $mode) {
+            $script:armCompatDirty = $true
+            $script:armCompatRestarted = @{}
+        }
+        $script:armCompatApplied = $Enabled
+        Write-WinoidLog "ARM compat: $mode (was $before)"
+        return $true
+    }
+    $detail = (($text -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' | '
+    Write-WinoidLog "ERROR ARM compat ($mode): exit $($r.Code) $detail"
+    return $false
+}
+
+# Make the runtime property match the setting before an app starts. A process
+# keeps the mode it was started with, so after a switch the previous instance
+# must be stopped instead of being brought back to the foreground.
+function Sync-ArmCompatMode([string]$Package) {
+    # On a cold manager start with the option off, Android already uses the
+    # default translator. Do not touch root/LXC unless the setting changed.
+    if ($null -eq $script:armCompatApplied -and -not $script:armCompat) {
+        $script:armCompatApplied = $false
+    }
+    if ($script:armCompatApplied -ne $script:armCompat) {
+        if ((Get-Date) -lt $script:armCompatNextTry) { return (-not $script:armCompat) }
+        if (-not (Set-ArmCompatMode $script:armCompat)) {
+            $script:armCompatNextTry = (Get-Date).AddSeconds(60)
+            # A failed switch must not stop an ordinary launch when compatibility
+            # mode is off: the app simply keeps the translator it already has.
+            return (-not $script:armCompat)
+        }
+    }
+    if ($script:armCompatDirty -and $Package -and -not $script:armCompatRestarted.ContainsKey($Package)) {
+        # A process keeps the translation mode it started with.
+        $null = Send-Android "am force-stop $Package"
+        $script:armCompatRestarted[$Package] = $true
+        Start-Sleep -Milliseconds 500
+    }
+    return $true
 }
 
 # Waydroid keeps its Android images and /sdcard in the session user's home.
@@ -1617,7 +1708,10 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         try {
             $p = Map-WrapperPoint $w $e.GetPosition($sender)
             if ($null -eq $p) { return }
-            [NativeWin]::ForceForeground($w.Source)
+            # Do not move foreground to the WSLg source here: WPF would lose
+            # mouse capture before MouseLeftButtonUp, leaving Android with a
+            # stuck DOWN and no tap. The activation timer restores focus to
+            # the source after the click.
             Send-Android "input motionevent DOWN $($p[0]) $($p[1])"
             $w.DragX = $p[0]; $w.DragY = $p[1]; $w.DragT = [DateTime]::UtcNow
             $w.Hint.Visibility = 'Collapsed'
@@ -1963,6 +2057,16 @@ function Start-AppLaunch($app) {
         }
     }
 
+    $compatNote = ''
+    try {
+        if (-not (Sync-ArmCompatMode $app.Package)) {
+            $compatNote = ' (режим совместимости ARM недоступен)'
+        }
+    } catch {
+        $compatNote = ' (режим совместимости ARM недоступен)'
+        Write-WinoidLog ("ERROR ARM compat before launch: " + $_.Exception.ToString())
+    }
+
     $script:launchState = [pscustomobject]@{
         App = $app
         Ticks = 0
@@ -1980,7 +2084,7 @@ function Start-AppLaunch($app) {
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
     $launchTimer.Start()
-    Set-Footer "Запуск $displayName…"
+    Set-Footer ("Запуск $displayName…" + $compatNote)
 
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $($app.Package)"
     try {
@@ -2408,9 +2512,29 @@ $sessionTimer.Add_Tick({
         $sessionTimer.Stop()
         $loader.Hide()
         Test-Session | Out-Null
+        $compatNote = ''
+        try {
+            if ($script:armCompat) {
+                if (Set-ArmCompatMode $true) {
+                    # A fresh Android session has no running apps, so nothing
+                    # needs restarting even if the property was changed.
+                    $script:armCompatDirty = $false
+                    $script:armCompatRestarted = @{}
+                } else {
+                    $compatNote = ' Режим совместимости ARM включить не удалось.'
+                }
+            } else {
+                $script:armCompatApplied = $false
+                $script:armCompatDirty = $false
+                $script:armCompatRestarted = @{}
+            }
+        } catch {
+            $compatNote = ' Режим совместимости ARM включить не удалось.'
+            Write-WinoidLog ("ERROR ARM compat on session: " + $_.Exception.ToString())
+        }
         Refresh-Apps
         Initialize-Adb
-        Set-Footer 'Android запущен.'
+        Set-Footer ('Android запущен.' + $compatNote)
         if ($script:pendingAndroidWindow) {
             $pending = $script:pendingAndroidWindow
             $script:pendingAndroidWindow = $null
@@ -2562,6 +2686,36 @@ $backendBtn.Add_Click({
 })
 $fullUiBtn.Add_Click({ Invoke-Safe 'restart' { Start-Session -Restart } })
 $settingsBtn.Add_Click({ Invoke-Safe 'settingsBtn' { Start-AndroidWindow 'com.android.settings' 'Настройки Android' } })
+$armCompatCheck.Add_Checked({
+    Invoke-Safe 'armCompatOn' {
+        $script:armCompat = [bool]$armCompatCheck.IsChecked
+        Save-ArmCompatSetting
+        if (-not $script:sessionRunning) {
+            Set-Footer 'Режим совместимости ARM включён. Применится при запуске Android.'
+            return
+        }
+        if (Set-ArmCompatMode $true) {
+            Set-Footer 'Режим совместимости ARM включён. Уже открытые игры закройте и откройте заново.'
+        } else {
+            Set-Footer 'Не удалось включить режим ARM. Подробности: %LOCALAPPDATA%\Winoid\winoid.log'
+        }
+    }
+})
+$armCompatCheck.Add_Unchecked({
+    Invoke-Safe 'armCompatOff' {
+        $script:armCompat = [bool]$armCompatCheck.IsChecked
+        Save-ArmCompatSetting
+        if (-not $script:sessionRunning) {
+            Set-Footer 'Режим совместимости ARM выключен.'
+            return
+        }
+        if (Set-ArmCompatMode $false) {
+            Set-Footer 'Режим совместимости ARM выключен. Уже открытые игры закройте и откройте заново.'
+        } else {
+            Set-Footer 'Не удалось выключить режим ARM. Подробности: %LOCALAPPDATA%\Winoid\winoid.log'
+        }
+    }
+})
 $showWindowBtn.Add_Click({
     Invoke-Safe 'showWindowBtn' {
         if ($script:launchState) {
