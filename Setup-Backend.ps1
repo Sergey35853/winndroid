@@ -215,6 +215,7 @@ fi
 if [ -f /var/lib/waydroid/images/system.img ] && [ -f /var/lib/waydroid/images/vendor.img ]; then echo IMAGES_OK; else echo IMAGES_MISSING; fi
 if grep -q '^ro.dalvik.vm.native.bridge = libndk_translation.so' /var/lib/waydroid/waydroid.cfg 2>/dev/null; then echo NDK_OK; else echo NDK_MISSING; fi
 if grep -q '^persist.waydroid.multi_windows = true' /var/lib/waydroid/waydroid.cfg 2>/dev/null; then echo MULTI_OK; else echo MULTI_MISSING; fi
+if grep -q '^ro\.build\.fingerprint=google/oriole/oriole:13/TQ3A\.230805\.001/10316531:user/release-keys$' /var/lib/waydroid/waydroid_base.prop 2>/dev/null; then echo FP_OK; else echo FP_OLD; fi
 if systemctl is-active --quiet waydroid-container 2>/dev/null; then echo CONTAINER_OK; else echo CONTAINER_STOPPED; fi
 '@
     $r = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture -TimeoutSeconds 60
@@ -231,8 +232,43 @@ if systemctl is-active --quiet waydroid-container 2>/dev/null; then echo CONTAIN
         Images     = ($text -match 'IMAGES_OK')
         Libndk     = ($text -match 'NDK_OK')
         MultiWin   = ($text -match 'MULTI_OK')
+        Fingerprint = ($text -match 'FP_OK')
         Container  = ($text -match 'CONTAINER_OK')
     }
+}
+
+function Repair-WaydroidFingerprint([string]$DistroName) {
+    $scriptText = @'
+set -e
+FP='google/oriole/oriole:13/TQ3A.230805.001/10316531:user/release-keys'
+CFG=/var/lib/waydroid/waydroid.cfg
+BASE=/var/lib/waydroid/waydroid_base.prop
+VENDOR=/var/lib/waydroid/rootfs/vendor/waydroid.prop
+for f in "$CFG" "$BASE" "$VENDOR"; do
+  [ -f "$f" ] || continue
+  [ -f "$f.winoid-backup" ] || cp -a "$f" "$f.winoid-backup"
+done
+if [ -f "$BASE" ]; then
+  sed -i '/^[[:space:]]*ro\.build\.fingerprint[[:space:]]*=/d' "$BASE"
+  printf 'ro.build.fingerprint=%s\n' "$FP" >> "$BASE"
+fi
+if [ -f "$VENDOR" ]; then
+  sed -i '/^[[:space:]]*ro\.build\.fingerprint[[:space:]]*=/d' "$VENDOR"
+  printf 'ro.build.fingerprint=%s\n' "$FP" >> "$VENDOR"
+fi
+if [ -f "$CFG" ]; then
+  sed -i '/^[[:space:]]*ro\.build\.fingerprint[[:space:]]*=/d' "$CFG"
+  if grep -q '^\[properties\]' "$CFG"; then
+    sed -i "/^\[properties\]/a ro.build.fingerprint = $FP" "$CFG"
+  else
+    printf '\n[properties]\nro.build.fingerprint = %s\n' "$FP" >> "$CFG"
+  fi
+fi
+echo FP_REPAIRED
+'@
+    $r = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture -TimeoutSeconds 90
+    if ($r.Code -ne 0) { throw "Не удалось исправить отпечаток Android: $($r.Err)" }
+    return ($r.Out -match 'FP_REPAIRED')
 }
 
 function Get-SessionState([string]$DistroName) {
@@ -403,6 +439,7 @@ function Show-Status([string]$DistroName) {
     if ($wd.Images) { Write-Ok 'Образы Android (GAPPS) на месте' } else { Write-Fail 'Образы Android не скачаны' }
     if ($wd.Libndk) { Write-Ok 'libndk (ARM-трансляция) включён' } else { Write-Warn 'libndk не установлен' }
     if ($wd.MultiWin) { Write-Ok 'multi_windows включён' } else { Write-Warn 'multi_windows выключен' }
+    if ($wd.Fingerprint) { Write-Ok 'Отпечаток Android совместим с античитом' } else { Write-Warn 'Стандартный отпечаток Android слишком длинный: часть игр не проходит проверку' }
 
     $session = Get-SessionState $DistroName
     if ($session.Session -eq 'RUNNING') { Write-Ok "Сессия Waydroid: RUNNING ($($session.User))" }
@@ -720,6 +757,29 @@ systemctl start waydroid-container.service 2>/dev/null || true
         }
     } else {
         Write-Ok 'libndk уже установлен'
+    }
+
+    # fingerprint
+    $wd = Get-WaydroidState $DistroName
+    if (-not $wd.Fingerprint) {
+        Write-Step 'Исправление отпечатка Android'
+        Write-Info 'Стандартный отпечаток Waydroid длиннее лимита системного свойства, и игры с античитом считают его недостоверным.'
+        if ($DryRun) { Write-Info 'Будет заменён ro.build.fingerprint на короткий отпечаток Pixel 6.' }
+        else {
+            $session = Get-SessionState $DistroName
+            if ($session.Session -eq 'RUNNING' -and $session.Uid) {
+                Write-Info 'Останавливаю Android, чтобы применить свойства…'
+                $scriptText = @"
+runuser -u '$($session.User)' -- env XDG_RUNTIME_DIR=/run/user/$($session.Uid) systemctl --user stop waydroid-session.service 2>/dev/null || true
+systemctl stop waydroid-container.service 2>/dev/null || true
+"@
+                [void](Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText -Capture -TimeoutSeconds 120)
+            }
+            Repair-WaydroidFingerprint $DistroName | Out-Null
+            Write-Ok 'Отпечаток Android исправлен'
+        }
+    } else {
+        Write-Ok 'Отпечаток Android уже исправлен'
     }
 
     # session service
