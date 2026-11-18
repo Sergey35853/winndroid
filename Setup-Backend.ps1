@@ -214,6 +214,8 @@ else
 fi
 if [ -f /var/lib/waydroid/images/system.img ] && [ -f /var/lib/waydroid/images/vendor.img ]; then echo IMAGES_OK; else echo IMAGES_MISSING; fi
 if grep -q '^ro.dalvik.vm.native.bridge = libndk_translation.so' /var/lib/waydroid/waydroid.cfg 2>/dev/null; then echo NDK_OK; else echo NDK_MISSING; fi
+if grep -q '^ro.dalvik.vm.native.bridge = libhoudini.so' /var/lib/waydroid/waydroid.cfg 2>/dev/null; then echo HOU_OK; else echo HOU_MISSING; fi
+if grep -q '^vendor_id[[:space:]]*: GenuineIntel' /proc/cpuinfo 2>/dev/null; then echo CPU_INTEL; elif grep -q '^vendor_id[[:space:]]*: AuthenticAMD' /proc/cpuinfo 2>/dev/null; then echo CPU_AMD; else echo CPU_OTHER; fi
 if grep -q '^persist.waydroid.multi_windows = true' /var/lib/waydroid/waydroid.cfg 2>/dev/null; then echo MULTI_OK; else echo MULTI_MISSING; fi
 if grep -q '^ro\.build\.fingerprint=google/oriole/oriole:13/TQ3A\.230805\.001/10316531:user/release-keys$' /var/lib/waydroid/waydroid_base.prop 2>/dev/null; then echo FP_OK; else echo FP_OLD; fi
 if systemctl is-active --quiet waydroid-container 2>/dev/null; then echo CONTAINER_OK; else echo CONTAINER_STOPPED; fi
@@ -226,11 +228,18 @@ if systemctl is-active --quiet waydroid-container 2>/dev/null; then echo CONTAIN
     if ($idx -ge 0 -and $idx + 1 -lt $lines.Count -and $lines[$idx + 1] -notmatch '^[A-Z_]+$') {
         $version = $lines[$idx + 1]
     }
+    $houdini = ($text -match 'HOU_OK')
+    $libndk = ($text -match 'NDK_OK')
+    $bridge = $(if ($houdini) { 'libhoudini' } elseif ($libndk) { 'libndk' } else { '' })
+    $cpu = $(if ($text -match 'CPU_INTEL') { 'intel' } elseif ($text -match 'CPU_AMD') { 'amd' } else { 'other' })
     return [pscustomobject]@{
         Installed  = ($text -match 'WAYDROID_OK')
         Version    = $version
         Images     = ($text -match 'IMAGES_OK')
-        Libndk     = ($text -match 'NDK_OK')
+        Libndk     = $libndk
+        Houdini    = $houdini
+        Bridge     = $bridge
+        Cpu        = $cpu
         MultiWin   = ($text -match 'MULTI_OK')
         Fingerprint = ($text -match 'FP_OK')
         Container  = ($text -match 'CONTAINER_OK')
@@ -362,7 +371,7 @@ function Get-ConfigSerial {
     return $script:AdbSerial
 }
 
-function Save-ManagerConfig([string]$DistroName, [string]$Serial) {
+function Save-ManagerConfig([string]$DistroName, [string]$Serial, [string]$Translator) {
     $cfg = @{}
     if (Test-Path -LiteralPath $script:ConfigPath) {
         try {
@@ -372,6 +381,7 @@ function Save-ManagerConfig([string]$DistroName, [string]$Serial) {
     }
     $cfg['wslDistro'] = $DistroName
     $cfg['adbSerial'] = $Serial
+    if ($Translator) { $cfg['armTranslator'] = $Translator }
     $json = $cfg | ConvertTo-Json -Depth 5
     Set-Content -LiteralPath $script:ConfigPath -Value $json -Encoding utf8NoBOM
     Write-Ok "Настройки менеджера: $script:ConfigPath"
@@ -437,7 +447,9 @@ function Show-Status([string]$DistroName) {
     $wd = Get-WaydroidState $DistroName
     if ($wd.Installed) { Write-Ok "Waydroid: $($wd.Version)" } else { Write-Fail 'Waydroid не установлен' }
     if ($wd.Images) { Write-Ok 'Образы Android (GAPPS) на месте' } else { Write-Fail 'Образы Android не скачаны' }
-    if ($wd.Libndk) { Write-Ok 'libndk (ARM-трансляция) включён' } else { Write-Warn 'libndk не установлен' }
+    if ($wd.Houdini) { Write-Ok 'libhoudini (ARM-трансляция, Intel) включён' }
+    elseif ($wd.Libndk) { Write-Ok 'libndk (ARM-трансляция) включён' }
+    else { Write-Warn 'ARM-трансляция не установлена' }
     if ($wd.MultiWin) { Write-Ok 'multi_windows включён' } else { Write-Warn 'multi_windows выключен' }
     if ($wd.Fingerprint) { Write-Ok 'Отпечаток Android совместим с античитом' } else { Write-Warn 'Стандартный отпечаток Android слишком длинный: часть игр не проходит проверку' }
 
@@ -453,7 +465,7 @@ function Show-Status([string]$DistroName) {
     elseif ($adb.Online) { Write-Ok "ADB: $serial подключён" }
     else { Write-Warn "ADB: $serial не отвечает" }
 
-    $ready = $kernel.Binder -and $wd.Installed -and $wd.Images -and $wd.Libndk -and ($session.Session -eq 'RUNNING')
+    $ready = $kernel.Binder -and $wd.Installed -and $wd.Images -and $wd.Bridge -and ($session.Session -eq 'RUNNING')
     Write-Host ''
     if ($ready) { Write-Host 'Итог: бэкенд готов.' -ForegroundColor Green }
     else { Write-Host 'Итог: бэкенд не готов. Запустите «Настроить / восстановить».' -ForegroundColor Yellow }
@@ -717,14 +729,23 @@ sed -i '/^\[properties\]/a persist.waydroid.multi_windows = true' "$cfg"
         Write-Ok 'multi_windows уже включён'
     }
 
-    # libndk
+    # ARM translation: Intel CPUs run libhoudini, AMD CPUs run libndk.
     $wd = Get-WaydroidState $DistroName
-    if (-not $wd.Libndk) {
-        Write-Step 'Установка libndk (ARM-трансляция)'
+    if ($wd.Bridge) {
+        $bridgeName = $(if ($wd.Houdini) { 'libhoudini' } else { 'libndk' })
+        Write-Ok "ARM-трансляция уже установлена: $bridgeName"
+    } else {
+        $translator = $(if ($wd.Cpu -eq 'intel') { 'libhoudini' } else { 'libndk' })
+        Write-Step "Установка $translator (ARM-трансляция)"
+        if ($translator -eq 'libhoudini') {
+            Write-Info 'Процессор Intel: libhoudini быстрее и стабильнее libndk в тяжёлых ARM-играх.'
+        } else {
+            Write-Info 'Процессор AMD: libndk — рекомендуемый ARM-транслятор.'
+        }
         Write-Info 'Используется waydroid_script: https://github.com/casualsnek/waydroid_script'
-        if ($DryRun) { Write-Info 'Будет выполнено: waydroid_script install libndk'; }
+        if ($DryRun) { Write-Info "Будет выполнено: waydroid_script install $translator"; }
         else {
-            if (-not (Confirm-Action 'Скачать и установить libndk с waydroid_script?')) { throw 'Установка libndk отменена.' }
+            if (-not (Confirm-Action "Скачать и установить $translator с waydroid_script?")) { throw "Установка $translator отменена." }
             $sessionNow = Get-SessionState $DistroName
             $uid = $sessionNow.Uid
             $user = $sessionNow.User
@@ -742,22 +763,23 @@ if [ ! -x venv/bin/python3 ]; then
   python3 -m venv venv
 fi
 venv/bin/pip install --quiet -r requirements.txt
-venv/bin/python3 main.py install libndk
+venv/bin/python3 main.py install __TRANSLATOR__
 systemctl start waydroid-container.service 2>/dev/null || true
 '@
             if ($uid) {
                 $stop = "runuser -u $user -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user stop waydroid-session.service 2>/dev/null || true"
             } else { $stop = 'true' }
             $scriptText = $scriptText -replace '__STOP_SESSION__', $stop
+            $scriptText = $scriptText -replace '__TRANSLATOR__', $translator
             $code = Invoke-RootScript -DistroName $DistroName -ScriptText $scriptText
-            if ($code -ne 0) { throw 'Установка libndk не удалась. Смотрите вывод выше.' }
+            if ($code -ne 0) { throw "Установка $translator не удалась. Смотрите вывод выше." }
             $wd = Get-WaydroidState $DistroName
-            if (-not $wd.Libndk) { throw 'libndk установлен, но свойство native.bridge не появилось в waydroid.cfg.' }
-            Write-Ok 'libndk установлен'
+            if (-not $wd.Bridge) { throw "$translator установлен, но свойство native.bridge не появилось в waydroid.cfg." }
+            Write-Ok "$translator установлен"
         }
-    } else {
-        Write-Ok 'libndk уже установлен'
     }
+    $wd = Get-WaydroidState $DistroName
+    $translator = $wd.Bridge
 
     # fingerprint
     $wd = Get-WaydroidState $DistroName
@@ -881,11 +903,11 @@ runuser -u '$user' -- env XDG_RUNTIME_DIR=/run/user/$uid systemctl --user restar
         }
         if ($adb.Online) {
             Write-Ok "ADB подключён: $serial"
-            Save-ManagerConfig $DistroName $serial
+            Save-ManagerConfig $DistroName $serial $translator
         } else {
             Write-Warn "ADB пока не ответил на $serial."
             Write-Info 'Он подключится автоматически при первом запуске приложения.'
-            Save-ManagerConfig $DistroName $serial
+            Save-ManagerConfig $DistroName $serial $translator
         }
     }
 

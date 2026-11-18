@@ -315,6 +315,9 @@ $script:armCompatApplied = $null
 $script:armCompatDirty = $false
 $script:armCompatNextTry = [DateTime]::MinValue
 $script:armCompatRestarted = @{}
+# '' = unknown, 'libndk' or 'libhoudini'. Saved by Setup-Backend, and read
+# from waydroid.cfg when the manager starts on an older install.
+$script:armTranslator = ''
 
 # One-time migration from the old Winndroid data directory.
 function Initialize-WinoidData {
@@ -373,6 +376,7 @@ if (Test-Path -LiteralPath $script:configPath) {
         $cfg = Get-Content -LiteralPath $script:configPath -Raw | ConvertFrom-Json
         if ($cfg.wslDistro) { $script:wslDistro = [string]$cfg.wslDistro }
         if ($cfg.adbSerial) { $script:adbSerial = [string]$cfg.adbSerial }
+        if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
         }
@@ -631,7 +635,7 @@ $mainXaml = @'
         </ComboBox>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
-        <TextBlock Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
+        <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
                    Text="Перетащите APK в окно, чтобы установить. Двойной клик по приложению запускает его в отдельном окне. Кнопка «Ярлык на рабочем столе» создаёт ярлык с родной иконкой приложения. «Настройки Android» открывает системные настройки, «Диск Android» — общую память Android в проводнике, «Перезапустить Android» возвращает окна, если графика WSL зависла. Окно Winoid можно открыть ярлыком на рабочем столе, в меню Пуск или файлом Winoid.cmd."/>
         </StackPanel>
@@ -785,6 +789,7 @@ $sizeBox       = $window.FindName('SizeBox')
 $autoHideCheck = $window.FindName('AutoHideCheck')
 $armCompatCheck = $window.FindName('ArmCompatCheck')
 $armCompatCheck.IsChecked = [bool]$script:armCompat
+$armCompatHint = $window.FindName('ArmCompatHint')
 $footerText    = $window.FindName('FooterText')
 
 $loaderTitle   = $loader.FindName('LoaderTitle')
@@ -951,6 +956,12 @@ function Set-ArmCompatMode([bool]$Enabled) {
 # keeps the mode it was started with, so after a switch the previous instance
 # must be stopped instead of being brought back to the foreground.
 function Sync-ArmCompatMode([string]$Package) {
+    # libhoudini has no ndk_translation.mode; nothing to synchronize.
+    if ((Get-ArmTranslator) -eq 'libhoudini') {
+        $script:armCompat = $false
+        $script:armCompatApplied = $false
+        return $true
+    }
     # On a cold manager start with the option off, Android already uses the
     # default translator. Do not touch root/LXC unless the setting changed.
     if ($null -eq $script:armCompatApplied -and -not $script:armCompat) {
@@ -1209,6 +1220,28 @@ function Get-WaydroidStatus {
     return 'STOPPED'
 }
 
+# Which ARM translator Waydroid uses. Setup-Backend stores it in config.json;
+# on older installs it is read from waydroid.cfg once per manager run.
+function Get-ArmTranslator {
+    if ($script:armTranslator) { return $script:armTranslator }
+    $r = Invoke-Wsl ((Get-WslBase) + @('--', 'grep', '-m1', '^ro\.dalvik\.vm\.native\.bridge', '/var/lib/waydroid/waydroid.cfg')) 8000
+    $text = $r.Out + "`n" + $r.Err
+    if ($text -match 'libhoudini') { $script:armTranslator = 'libhoudini' }
+    elseif ($text -match 'libndk') { $script:armTranslator = 'libndk' }
+    return $script:armTranslator
+}
+
+# libndk's compatibility mode has no equivalent in libhoudini, so the option
+# is hidden on Intel machines instead of pretending to do something.
+function Update-ArmCompatUi {
+    if ((Get-ArmTranslator) -ne 'libhoudini') { return }
+    $script:armCompat = $false
+    if ($armCompatCheck) { $armCompatCheck.Visibility = 'Collapsed' }
+    if ($armCompatHint) {
+        $armCompatHint.Text = 'На этом компьютере используется libhoudini (Intel) — режим совместимости нужен только для libndk на AMD.'
+    }
+}
+
 function Test-Backend {
     $cmd = 'command -v waydroid >/dev/null 2>&1 && echo WINOID_BACKEND_OK'
     $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 10000
@@ -1218,6 +1251,7 @@ function Test-Backend {
 function Test-Session {
     if ((Get-WaydroidStatus) -eq 'RUNNING') {
         $script:sessionRunning = $true
+        Update-ArmCompatUi
         Set-Status 'Android работает' '#3DDC84'
         $backendBtn.Visibility = 'Collapsed'
         return $true
@@ -1229,6 +1263,7 @@ function Test-Session {
         Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
         return $false
     }
+    Update-ArmCompatUi
     Set-Status 'Android остановлен' '#F5A623'
     $backendBtn.Visibility = 'Collapsed'
     return $false

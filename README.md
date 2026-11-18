@@ -11,9 +11,9 @@ Android-приложения и игры в отдельных окнах Window
 · [Исходники и portable-zip](https://github.com/Sergey35853/winoid/releases)
 
 > **Статус: альфа.** Проект личный, публикуется для энтузиастов. Бэкенд
-> (WSL-ядро с binder, Waydroid, GApps, libndk) ставится кнопкой
-> **«Настроить Android»** в менеджере (экспериментально). Ядро, GApps и libndk
-> скачиваются на машине пользователя и не входят в поставку.
+> (WSL-ядро с binder, Waydroid, GApps, ARM-транслятор) ставится кнопкой
+> **«Настроить Android»** в менеджере (экспериментально). Ядро, GApps и
+> транслятор скачиваются на машине пользователя и не входят в поставку.
 
 ![Менеджер Winoid](docs/screenshot-manager.png)
 
@@ -33,9 +33,13 @@ Android-приложения и игры в отдельных окнах Window
   родную иконку приложения.
 - Кнопка «Настройки Android» открывает системные настройки одним обычным
   окном: список разделов и панель подробностей склеиваются в один экран.
+- **ARM-трансляция** ставится автоматически: libhoudini на процессорах Intel
+  и libndk на AMD. На Intel libhoudini заметно быстрее и не падает в тяжёлых
+  Unity-играх.
 - **Режим совместимости ARM** помогает играм, которые зависают в тяжёлом
-  оптимизаторе libndk. Настройка сохраняется между запусками; уже открытые
-  игры нужно закрыть и открыть заново.
+  оптимизаторе libndk (актуален только для libndk/AMD; на Intel опция
+  скрыта). Настройка сохраняется между запусками; уже открытые игры нужно
+  закрыть и открыть заново.
 - Кнопка «Перезапустить Android» поднимает сессию Waydroid заново, если окна
   пропали после сна Windows или сбоя графики WSL.
 - Показывает индикатор запуска, пока приложение не отрисует первый кадр.
@@ -53,12 +57,13 @@ Android-приложения и игры в отдельных окнах Window
   `kernel-6.18.58.1`.
 - Waydroid 1.6.x, инициализированный с GApps, если нужен Play Store.
 - `persist.waydroid.multi_windows = true`.
-- libndk, если нужны ARM-приложения и игры.
+- ARM-транслятор (libhoudini на Intel, libndk на AMD), если нужны
+  ARM-приложения и игры.
 - PowerShell 7.
 - Android platform-tools (`adb.exe`) — скрипт скачивает при необходимости.
 
-GApps, Play Store и libndk **не входят** в поставку: скрипт скачивает и
-устанавливает их на машине пользователя. Это осознанное ограничение по
+GApps, Play Store и ARM-транслятор **не входят** в поставку: скрипт скачивает
+и устанавливает их на машине пользователя. Это осознанное ограничение по
 лицензиям.
 
 ## Быстрый старт
@@ -151,8 +156,9 @@ ADB ищется по порядку:
    сохранит резервную копию `.wslconfig` и перезапустит WSL.
 3. Установит Waydroid из `repo.waydro.id`.
 4. Скачает образы Android с GAPPS (около 3 ГБ) с `ota.waydro.id`.
-5. Установит libndk через
-   [waydroid_script](https://github.com/casualsnek/waydroid_script).
+5. Установит ARM-транслятор через
+   [waydroid_script](https://github.com/casualsnek/waydroid_script):
+   libhoudini на Intel, libndk на AMD.
 6. Заменит `ro.build.fingerprint` на короткий отпечаток Pixel 6: стандартный
    отпечаток Waydroid длиннее лимита системного свойства, и игры с античитом
    считают такое устройство поддельным.
@@ -229,7 +235,7 @@ pwsh -File .\Setup-Backend.ps1 -Mode Install -DryRun  # показать пла�
    systemctl --user enable --now waydroid-session.service
    ```
 
-6. Установите libndk, если нужны ARM-приложения. Удобный способ —
+6. Установите ARM-транслятор, если нужны ARM-приложения. Удобный способ —
    [waydroid_script](https://github.com/casualsnek/waydroid_script):
 
    ```bash
@@ -237,8 +243,13 @@ pwsh -File .\Setup-Backend.ps1 -Mode Install -DryRun  # показать пла�
    cd waydroid_script
    sudo python3 -m venv venv
    sudo venv/bin/pip install -r requirements.txt
-   sudo venv/bin/python3 main.py install libndk
+   sudo venv/bin/python3 main.py install libhoudini   # Intel
+   # или
+   sudo venv/bin/python3 main.py install libndk       # AMD
    ```
+
+   На Intel libhoudini быстрее и стабильнее: libndk иногда падает в
+   античит-библиотеках тяжёлых Unity-игр.
 
 7. Подключите ADB с Windows:
 
@@ -267,12 +278,12 @@ pwsh -File .\Setup-Backend.ps1 -Mode Install -DryRun  # показать пла�
 - **Сон Windows и WSLg.** После сна или сбоя графики окна Android могут стать
   невидимыми. Кнопка **Перезапустить Android** возвращает их; если не помогло,
   выполните `wsl --shutdown` и запустите Winoid заново.
-- **Тяжёлые ARM-игры и libndk.** Некоторые Unity-игры, например Infinite
-  Magicraid, зависают в тяжёлом оптимизаторе libndk: процесс крутится на
-  100% CPU, а окно и сам Android остаются чёрными. Включите **Режим
-  совместимости ARM** в менеджере — игра запустится в облегчённом режиме
-  трансляции ARM-кода. Он медленнее обычного, но не зацикливается. Это
-  обход известной ошибки Waydroid
+- **Тяжёлые ARM-игры.** На Intel Winoid ставит libhoudini — он запускает
+  Infinite Magicraid и другие Unity-игры без зависаний. На AMD используется
+  libndk: некоторые игры зависают в его тяжёлом оптимизаторе (процесс
+  крутится на 100% CPU, окно чёрное). Для них включите **Режим совместимости
+  ARM** в менеджере — это облегчённый режим трансляции, медленнее, но не
+  зацикливается. Известная ошибка Waydroid
   ([#2446](https://github.com/waydroid/waydroid/issues/2446)).
 - **GApps и Google-аккаунт.** Использование GApps может нарушать условия
   Google; ответственность на пользователе. Play Store может считать устройство
