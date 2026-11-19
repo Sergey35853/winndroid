@@ -752,7 +752,7 @@ $script:wrapperXaml = @'
     </Border>
     <Grid>
       <Image x:Name="View" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
-      <Border x:Name="Loading" Background="#E60B0C0E">
+      <Border x:Name="Loading" Background="#E60B0C0E" IsHitTestVisible="False">
         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border Width="46" Height="46" CornerRadius="12" Background="#2A3550" HorizontalAlignment="Center">
             <TextBlock Text="A" Foreground="#7EA6FF" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
@@ -761,7 +761,8 @@ $script:wrapperXaml = @'
         </StackPanel>
       </Border>
       <Border x:Name="Hint" Background="#CC101318" CornerRadius="10" Padding="14,10"
-              HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,18">
+              HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,18"
+              IsHitTestVisible="False">
         <TextBlock Text="Нажмите на окно — ввод пойдёт в Android" Foreground="#D6DAE2" FontSize="12"/>
       </Border>
     </Grid>
@@ -1488,11 +1489,29 @@ function Map-WrapperPoint($w, $pos) {
     if ($scale -le 0) { return $null }
     $ox = ($cw - $w.SrcW * $scale) / 2
     $oy = ($ch - $w.SrcH * $scale) / 2
-    $sx = [int](($pos.X - $ox) / $scale)
-    $sy = [int](($pos.Y - $oy) / $scale)
-    if ($sx -lt 0) { $sx = 0 }; if ($sy -lt 0) { $sy = 0 }
-    if ($sx -ge $w.SrcW) { $sx = $w.SrcW - 1 }; if ($sy -ge $w.SrcH) { $sy = $w.SrcH - 1 }
-    return @($sx, $sy)
+    $fx = ($pos.X - $ox) / $scale
+    $fy = ($pos.Y - $oy) / $scale
+    # Clicks in the black letterbox around the image are not taps at the
+    # nearest Android edge; ignore them entirely.
+    if ($fx -lt 0 -or $fy -lt 0 -or $fx -ge $w.SrcW -or $fy -ge $w.SrcH) { return $null }
+    $sx = [int][math]::Floor($fx)
+    $sy = [int][math]::Floor($fy)
+    foreach ($pane in @($w.Panes)) {
+        $x0 = [int]$pane.VX; $y0 = [int]$pane.VY
+        $x1 = $x0 + [int]$pane.W; $y1 = $y0 + [int]$pane.VisH
+        if ($sx -lt $x0 -or $sx -ge $x1 -or $sy -lt $y0 -or $sy -ge $y1) { continue }
+        $al = $pane.PSObject.Properties['AndroidL']
+        $at = $pane.PSObject.Properties['AndroidT']
+        if ($null -ne $al -and $null -ne $at) {
+            $tx = [int]$al.Value
+            $ty = [int]$at.Value
+            $tx = $tx + $sx - $x0
+            $ty = $ty + $sy - $y0
+            return @($tx, $ty)
+        }
+        return @($sx, $sy)
+    }
+    return $null
 }
 
 function Get-AppDisplayName($app) {
@@ -1588,6 +1607,69 @@ function Get-AppPanes($app, [IntPtr]$source) {
     }
 }
 
+# Returns the Android freeform frames (window bounds) of a package. The
+# WSLg window shows the app surface, but ADB input is whole-display input:
+# without the frame origin every tap lands near the top-left of Android.
+function Get-AndroidWindowFrames([string]$package) {
+    if ([string]::IsNullOrWhiteSpace($package)) { return @() }
+    $text = ''
+    try {
+        if ($script:adbViaWsl) {
+            $r = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'dumpsys', 'window', 'windows')) 9000
+            if ($r -and $r.Code -eq 0) { $text = [string]$r.Out }
+        }
+    } catch { }
+    if ([string]::IsNullOrWhiteSpace($text) -and $script:adbPath) {
+        try { $text = [string](Invoke-AdbCli @('-s', $script:adbSerial, 'shell', 'dumpsys', 'window', 'windows') 9000) } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { return @() }
+
+    $frames = New-Object System.Collections.ArrayList
+    foreach ($block in [regex]::Split($text, '(?m)^\s*Window #')) {
+        if ($block -notmatch 'u\d+\s+([^\s/]+)/') { continue }
+        if ($matches[1] -ne $package) { continue }
+        $fm = [regex]::Match($block, 'frame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
+        if (-not $fm.Success) { continue }
+        $l = [int]$fm.Groups[1].Value; $t = [int]$fm.Groups[2].Value
+        $r = [int]$fm.Groups[3].Value; $b = [int]$fm.Groups[4].Value
+        if ($r -le $l -or $b -le $t) { continue }
+        [void]$frames.Add([pscustomobject]@{ L = $l; T = $t; W = $r - $l; H = $b - $t })
+    }
+    return @($frames)
+}
+
+# Matches each captured pane with its Android window frame. A pane can be
+# exactly the size of its frame (it contains the freeform title bar) or
+# short by that title bar (immersive windows). In both cases the app starts
+# just below the title bar, so a shorter pane is shifted down by the delta.
+function Set-PaneAndroidFrames($panes, $frames) {
+    foreach ($pane in @($panes)) {
+        $pw = [int]$pane.W; $ph = [int]$pane.H
+        $best = $null; $bestDelta = 9999
+        foreach ($f in @($frames)) {
+            $dw = $pw - [int]$f.W
+            $dh = $ph - [int]$f.H
+            # WSLg adds a 12 px shadow around the app surface; immersive
+            # windows omit the 48 px freeform title bar. Both stay within
+            # these bounds, while unrelated windows are far larger.
+            if ([math]::Abs($dw) -gt 64 -or [math]::Abs($dh) -gt 96) { continue }
+            $delta = [math]::Abs($dw) + [math]::Abs($dh)
+            if ($delta -lt $bestDelta) { $best = $f; $bestDelta = $delta }
+        }
+        if ($null -eq $best) { continue }
+
+        $dw = $pw - [int]$best.W; $dh = $ph - [int]$best.H
+        $ax = [int]$best.L; $ay = [int]$best.T
+        if ($dw -gt 0) { $ax -= [int][math]::Round($dw / 2) }
+        elseif ($dw -lt 0) { $ax += -$dw }
+        if ($dh -gt 0) { $ay -= [int][math]::Round($dh / 2) }
+        elseif ($dh -lt 0) { $ay += -$dh }
+
+        $pane | Add-Member -NotePropertyName AndroidL -NotePropertyValue $ax -Force
+        $pane | Add-Member -NotePropertyName AndroidT -NotePropertyValue $ay -Force
+    }
+}
+
 function Restore-Source($w) {
     foreach ($pane in (@($w.Panes) + @($w.Parked))) {
         if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
@@ -1641,6 +1723,20 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     if ($panes.Count -eq 0 -or $srcW -lt 100 -or $srcH -lt 60) { return $null }
     $displayName = Get-AppDisplayName $app
 
+    # ADB input is display-wide, while the captured panes start at their
+    # Android freeform frame. Record each pane's frame origin so taps are
+    # translated to the right place instead of the top-left of Android.
+    $androidFrames = @(Get-AndroidWindowFrames $app.Package)
+    Set-PaneAndroidFrames $panes $androidFrames
+    try {
+        $paneInfo = @($panes | ForEach-Object {
+            $al = $_.PSObject.Properties['AndroidL']; $at = $_.PSObject.Properties['AndroidT']
+            if ($null -ne $al -and $null -ne $at) { "$([int]$_.W)x$([int]$_.H)@$($al.Value),$($at.Value)" }
+            else { "$([int]$_.W)x$([int]$_.H)@?" }
+        }) -join ' '
+        Write-WinoidLog ("wrapper $($app.Package): frames=$($androidFrames.Count) panes=$paneInfo")
+    } catch { }
+
     # WSLg splits an Android window into a top-level frame and one or more
     # sub-surface windows (content, navigation bar, dialogs). Only the panes
     # are captured; every other surface owned by the same top-level window is
@@ -1648,6 +1744,12 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $paneSources = New-Object 'System.Collections.Generic.HashSet[System.IntPtr]'
     foreach ($pane in $panes) { [void]$paneSources.Add($pane.Source) }
     $parked = New-Object System.Collections.ArrayList
+
+    # Park outside the whole virtual desktop. 3000 px from the primary
+    # origin is still a real position when a second monitor sits to the
+    # left (negative coordinates) or the desktop is wider than 3000 px.
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $parkBase = $vs.Right + 200
     foreach ($wnd in @($spec.Windows)) {
         if ($null -eq $wnd -or -not $wnd.Visible) { continue }
         if ($wnd.RootOwner -ne $spec.RootOwner) { continue }
@@ -1665,7 +1767,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         }
         $extraParkedEx = (($extraEx -bor 0x00000080) -band (-bnot 0x00040000))
         [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, $extraParkedEx)
-        $parkX = 3000 + [Math]::Max(0, $wnd.Left - $spec.MinLeft)
+        $parkX = $parkBase + [Math]::Max(0, $wnd.Left - $spec.MinLeft)
         [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, $parkX, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
         [void]$parked.Add([pscustomobject]@{
             Source = $wnd.Hwnd
@@ -1700,6 +1802,9 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         $pane | Add-Member -NotePropertyName OrigRect -NotePropertyValue $paneRect -Force
         $pane | Add-Member -NotePropertyName WasZoomed -NotePropertyValue $paneZoomed -Force
         $pane | Add-Member -NotePropertyName Grab -NotePropertyValue ([FrameGrabber]::new([int]$pane.W, [int]$pane.H)) -Force
+        $paneParkX = $parkBase + $vx
+        $pane | Add-Member -NotePropertyName ParkX -NotePropertyValue $paneParkX -Force
+        $pane | Add-Member -NotePropertyName ParkY -NotePropertyValue 0 -Force
 
         if ($paneZoomed) {
             [void][NativeWin]::ShowWindow($pane.Source, 9)
@@ -1709,10 +1814,10 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         }
         $parkedEx = (($paneOrigEx -bor 0x00000080) -band (-bnot 0x00040000))
         [void][NativeWin]::SetWindowLong($pane.Source, -20, $parkedEx)
-        [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $vx, 0, [int]$pane.W, [int]$pane.H, 0x0010)
+        [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $paneParkX, 0, [int]$pane.W, [int]$pane.H, 0x0010)
         if ($paneZoomed) {
             [System.Threading.Thread]::Sleep(120)
-            [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $vx, 0, [int]$pane.W, [int]$pane.H, 0x0010)
+            [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $paneParkX, 0, [int]$pane.W, [int]$pane.H, 0x0010)
         }
     }
 
@@ -1759,7 +1864,10 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         $w = $script:wrapByImage[$sender]
         if ($null -eq $w -or $w.Closed) { return }
         try {
-            $p = Map-WrapperPoint $w $e.GetPosition($sender)
+            $raw = $e.GetPosition($sender)
+            $p = Map-WrapperPoint $w $raw
+            $pText = if ($null -ne $p) { "$($p[0]),$($p[1])" } else { "null" }
+            Write-WinoidLog ("click " + $w.Package + " raw=" + [int]$raw.X + "," + [int]$raw.Y + " mapped=" + $pText)
             if ($null -eq $p) { return }
             # Do not move foreground to the WSLg source here: WPF would lose
             # mouse capture before MouseLeftButtonUp, leaving Android with a
@@ -1769,7 +1877,9 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             $w.DragX = $p[0]; $w.DragY = $p[1]; $w.DragT = [DateTime]::UtcNow
             $w.Hint.Visibility = 'Collapsed'
             [void]$sender.CaptureMouse()
-        } catch { }
+        } catch {
+            Write-WinoidLog ("click error: " + $_.Exception.ToString() + " AT " + $_.ScriptStackTrace)
+        }
     })
     $image.Add_MouseMove({
         param($sender, $e)
@@ -1956,9 +2066,9 @@ $script:frameTimer.Add_Tick({
                 }
                 $sr = New-Object NativeWin+RECT
                 [void][NativeWin]::GetWindowRect($pane.Source, [ref]$sr)
-                if ($sr.Left -lt $wa.Right -and $sr.Right -gt $wa.Left -and $sr.Top -lt $wa.Bottom -and $sr.Bottom -gt $wa.Top) {
+                if ([math]::Abs($sr.Left - $pane.ParkX) -gt 1 -or [math]::Abs($sr.Top - $pane.ParkY) -gt 1) {
                     if ([NativeWin]::IsZoomed($pane.Source)) { [void][NativeWin]::ShowWindow($pane.Source, 9) }
-                    [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, 3000 + $pane.VX, 0, $pane.W, $pane.H, 0x0010)
+                    [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $pane.ParkX, $pane.ParkY, $pane.W, $pane.H, 0x0010)
                 }
                 if (-not $capture) { continue }
                 [void]$pane.Grab.Capture($pane.Source)
@@ -1972,7 +2082,7 @@ $script:frameTimer.Add_Tick({
                 if ($null -eq $extra -or -not [NativeWin]::IsWindow($extra.Source)) { continue }
                 $er = New-Object NativeWin+RECT
                 [void][NativeWin]::GetWindowRect($extra.Source, [ref]$er)
-                if ($er.Left -lt $wa.Right -and $er.Right -gt $wa.Left -and $er.Top -lt $wa.Bottom -and $er.Bottom -gt $wa.Top) {
+                if ([math]::Abs($er.Left - $extra.ParkX) -gt 1 -or [math]::Abs($er.Top - $extra.ParkY) -gt 1) {
                     [void][NativeWin]::SetWindowPos($extra.Source, [IntPtr]::Zero, $extra.ParkX, $extra.ParkY, $extra.W, $extra.H, 0x0010)
                 }
             }
@@ -1980,12 +2090,12 @@ $script:frameTimer.Add_Tick({
             $w.Frames++
             if (-not $w.Settled -and ($w.Frames % 8) -eq 0) {
                 $elapsed = ([DateTime]::UtcNow - $w.LoadStart).TotalSeconds
-                if ($elapsed -ge 1 -and ($lumaSum / $lumaRows) -ge 8) {
+                # Dark apps (game menus, splash screens) are still content:
+                # anything but a near-black frame means we can show the app.
+                # As a last resort stop covering it after a few seconds.
+                if ($elapsed -ge 1.5 -and (($lumaSum / $lumaRows) -ge 1 -or $elapsed -ge 6)) {
                     $w.Settled = $true
                     $w.Loading.Visibility = 'Collapsed'
-                } elseif ($elapsed -ge 45 -and $w.LoadPhase -lt 2) {
-                    $w.LoadPhase = 2
-                    $w.LoadingText.Text = 'Кадр не появился за 45 секунд. Приложение может быть несовместимо с Waydroid или ждать ответа сервера.'
                 } elseif ($elapsed -ge 10 -and $w.LoadPhase -lt 1) {
                     $w.LoadPhase = 1
                     $w.LoadingText.Text = 'Приложение ещё загружается…'
