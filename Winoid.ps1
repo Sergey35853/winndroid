@@ -385,7 +385,9 @@ if (Test-Path -LiteralPath $script:configPath) {
 if ($env:WINOID_WSL_DISTRO) { $script:wslDistro = $env:WINOID_WSL_DISTRO }
 if ($env:WINOID_ADB_SERIAL) { $script:adbSerial = $env:WINOID_ADB_SERIAL }
 
-# Keep the user's existing config keys; only add or update armCompat.
+# Keep the user's existing config keys; only add or update ARM settings.
+# The translator is remembered too, so the manager does not have to inspect
+# waydroid.cfg on every start.
 function Save-ArmCompatSetting {
     try {
         $cfg = $null
@@ -397,6 +399,13 @@ function Save-ArmCompatSetting {
             $cfg.armCompat = [bool]$script:armCompat
         } else {
             $cfg | Add-Member -NotePropertyName armCompat -NotePropertyValue ([bool]$script:armCompat)
+        }
+        if ($script:armTranslator) {
+            if ($cfg.PSObject.Properties.Name -contains 'armTranslator') {
+                $cfg.armTranslator = [string]$script:armTranslator
+            } else {
+                $cfg | Add-Member -NotePropertyName armTranslator -NotePropertyValue ([string]$script:armTranslator)
+            }
         }
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
     } catch {
@@ -1235,7 +1244,16 @@ function Get-ArmTranslator {
 # is hidden on Intel machines instead of pretending to do something.
 function Update-ArmCompatUi {
     if ((Get-ArmTranslator) -ne 'libhoudini') { return }
-    $script:armCompat = $false
+    if ($script:armCompat) {
+        # Upgrading from a libndk install can leave the old setting in
+        # config.json. Clear it once so it cannot come back or confuse a later
+        # translator switch.
+        $script:armCompat = $false
+        $script:armCompatApplied = $false
+        $script:armCompatDirty = $false
+        $script:armCompatRestarted = @{}
+        Save-ArmCompatSetting
+    }
     if ($armCompatCheck) { $armCompatCheck.Visibility = 'Collapsed' }
     if ($armCompatHint) {
         $armCompatHint.Text = 'На этом компьютере используется libhoudini (Intel) — режим совместимости нужен только для libndk на AMD.'
