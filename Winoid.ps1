@@ -87,8 +87,20 @@ public class NativeWin {
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vkey);
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+    // Windows 10/11 pick a dark caption from this attribute; the old 19 is
+    // kept for pre-2004 builds where 20 is ignored.
+    public static void UseDarkTitleBar(IntPtr h) {
+        if (h == IntPtr.Zero) return;
+        int on = 1;
+        DwmSetWindowAttribute(h, 20, ref on, 4);
+        DwmSetWindowAttribute(h, 19, ref on, 4);
+    }
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
@@ -167,6 +179,10 @@ public class NativeWin {
             SetForegroundWindow(h);
         }
     }
+
+    public static bool LeftButtonDown() {
+        return (GetAsyncKeyState(0x01) & 0x8000) != 0;
+    }
 }
 
 public class FrameGrabber : IDisposable {
@@ -207,6 +223,49 @@ public class FrameGrabber : IDisposable {
             n++;
         }
         return n == 0 ? 0 : sum / (double)n / 3.0;
+    }
+
+    // WSLg sometimes centers its translucent shadow around the app surface
+    // and sometimes leaves it all on the right/bottom. Find where a
+    // cw x ch content rectangle sits inside this W x H window by picking
+    // the window position with the brightest margins (the shadow is black).
+    public bool FindContentOffset(int cw, int ch, out int ox, out int oy) {
+        ox = 0; oy = 0;
+        if (cw <= 0 || ch <= 0 || cw > W || ch > H) return false;
+        if (cw == W && ch == H) return true;
+        double[] col = new double[W];
+        double[] row = new double[H];
+        for (int x = 0; x < W; x++) {
+            long s = 0; int n = 0;
+            for (int y = 0; y < H; y += 5) {
+                int off = y * Stride + x * 4;
+                s += Marshal.ReadByte(_bits, off) + Marshal.ReadByte(_bits, off + 1) + Marshal.ReadByte(_bits, off + 2);
+                n++;
+            }
+            col[x] = n > 0 ? (double)s / n : 0;
+        }
+        for (int y = 0; y < H; y++) {
+            long s = 0; int n = 0;
+            for (int x = 0; x < W; x += 5) {
+                int off = y * Stride + x * 4;
+                s += Marshal.ReadByte(_bits, off) + Marshal.ReadByte(_bits, off + 1) + Marshal.ReadByte(_bits, off + 2);
+                n++;
+            }
+            row[y] = n > 0 ? (double)s / n : 0;
+        }
+        double best = -1;
+        for (int x0 = 0; x0 <= W - cw; x0++) {
+            double s = 0;
+            for (int x = x0; x < x0 + cw; x++) s += col[x];
+            if (s > best) { best = s; ox = x0; }
+        }
+        best = -1;
+        for (int y0 = 0; y0 <= H - ch; y0++) {
+            double s = 0;
+            for (int y = y0; y < y0 + ch; y++) s += row[y];
+            if (s > best) { best = s; oy = y0; }
+        }
+        return true;
     }
 
     public void Dispose() {
@@ -262,6 +321,25 @@ public class AdbShell : IDisposable {
         }
         sw.Stop();
         return sw.ElapsedMilliseconds;
+    }
+
+    // Runs a command on the persistent shell and returns its output. Used
+    // sparingly (Settings Back) so the UI does not launch a slow wsl.exe.
+    public string SendQuery(string cmd, int timeoutMs) {
+        if (!Running) throw new InvalidOperationException("adb shell is not running");
+        string marker = "Q" + Guid.NewGuid().ToString("N");
+        StringBuilder sb = new StringBuilder();
+        _p.StandardInput.Write(cmd + "; echo " + marker + "\n");
+        _p.StandardInput.Flush();
+        var sw = Stopwatch.StartNew();
+        string line;
+        while (sw.ElapsedMilliseconds < timeoutMs) {
+            if (_lines.TryTake(out line, 25)) {
+                if (line == marker) break;
+                sb.AppendLine(line);
+            }
+        }
+        return sb.ToString();
     }
 
     public void Dispose() {
@@ -557,6 +635,43 @@ $mainXaml = @'
         </Setter.Value>
       </Setter>
     </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" Orientation="{TemplateBinding Orientation}" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}" Focusable="False" Opacity="0">
+                    <RepeatButton.Template>
+                      <ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate>
+                    </RepeatButton.Template>
+                  </RepeatButton>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb MinHeight="24">
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="Thumb">
+                        <Border Background="#3A3D46" CornerRadius="5" Margin="2,0"/>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}" Focusable="False" Opacity="0">
+                    <RepeatButton.Template>
+                      <ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate>
+                    </RepeatButton.Template>
+                  </RepeatButton>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
 
   <Grid Margin="20">
@@ -572,13 +687,13 @@ $mainXaml = @'
         <ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
       <StackPanel>
-        <TextBlock Text="Winoid" FontSize="28" FontWeight="SemiBold"/>
+        <TextBlock Text="Winoid" FontSize="28" FontWeight="SemiBold" Foreground="#F1F3F5"/>
         <TextBlock Text="Android-приложения в отдельных окнах Windows" FontSize="12" Foreground="#8D929C" Margin="0,2,0,0"/>
       </StackPanel>
       <Border Grid.Column="1" Background="#1E2027" BorderBrush="#2E3139" BorderThickness="1" CornerRadius="20" Padding="14,7" VerticalAlignment="Center">
         <StackPanel Orientation="Horizontal">
           <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#F5A623" Margin="0,0,8,0" VerticalAlignment="Center"/>
-          <TextBlock x:Name="StatusText" Text="Проверка…" FontSize="12"/>
+          <TextBlock x:Name="StatusText" Text="Проверка…" FontSize="12" Foreground="#A9AEBA"/>
         </StackPanel>
       </Border>
     </Grid>
@@ -611,10 +726,10 @@ $mainXaml = @'
                     <ColumnDefinition Width="Auto"/>
                   </Grid.ColumnDefinitions>
                   <Border Width="34" Height="34" CornerRadius="9" Background="#2A2F3A" VerticalAlignment="Center">
-                    <TextBlock Text="A" FontSize="16" FontWeight="Bold" Foreground="#7EA6FF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <Image Source="{Binding Icon}" Width="26" Height="26" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                   </Border>
                   <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center">
-                    <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" Foreground="#F1F3F5" TextTrimming="CharacterEllipsis"/>
                     <TextBlock Text="{Binding Package}" FontSize="11" Foreground="#A9AEBA" TextTrimming="CharacterEllipsis"/>
                   </StackPanel>
                   <TextBlock Grid.Column="2" Text="↗" FontSize="16" Foreground="#5E6470" VerticalAlignment="Center" Margin="8,0,4,0"/>
@@ -673,7 +788,7 @@ $loaderXaml = @'
       </Grid.RowDefinitions>
       <StackPanel Orientation="Horizontal">
         <Border Width="34" Height="34" CornerRadius="9" Background="#2A3550" Margin="0,0,12,0">
-          <TextBlock Text="A" Foreground="#7EA6FF" FontSize="17" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          <Image x:Name="LoaderIcon" Width="24" Height="24" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
         </Border>
         <StackPanel VerticalAlignment="Center">
           <TextBlock x:Name="LoaderTitle" Text="Запуск…" FontSize="17" FontWeight="SemiBold" Foreground="#F1F3F5"/>
@@ -701,7 +816,8 @@ $script:wrapperXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Width="1280" Height="860" MinWidth="360" MinHeight="300"
-        WindowStartupLocation="CenterScreen" Background="#0B0C0E">
+        WindowStartupLocation="CenterScreen" Background="#0B0C0E"
+        ResizeMode="CanResizeWithGrip">
   <Window.Resources>
     <Style TargetType="Button">
       <Setter Property="Background" Value="#26282F"/>
@@ -746,8 +862,8 @@ $script:wrapperXaml = @'
           <Button x:Name="HomeBtn" Content="●  Домой" ToolTip="На главный экран Android (Home)"/>
           <Button x:Name="RecentsBtn" Content="■  Недавние" ToolTip="Недавние приложения Android"/>
         </StackPanel>
-        <TextBlock Grid.Column="1" Text="Android-навигация" FontSize="11"
-                   HorizontalAlignment="Right" VerticalAlignment="Center"/>
+        <TextBlock x:Name="NavLabel" Grid.Column="1" Text="Android-навигация" FontSize="11"
+                   HorizontalAlignment="Right" VerticalAlignment="Center" Margin="8,0,14,0" Foreground="#A9AEBA"/>
       </Grid>
     </Border>
     <Grid>
@@ -755,7 +871,7 @@ $script:wrapperXaml = @'
       <Border x:Name="Loading" Background="#E60B0C0E" IsHitTestVisible="False">
         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border Width="46" Height="46" CornerRadius="12" Background="#2A3550" HorizontalAlignment="Center">
-            <TextBlock Text="A" Foreground="#7EA6FF" FontSize="22" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Image x:Name="LoadingIcon" Width="30" Height="30" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
           </Border>
           <TextBlock x:Name="LoadingText" Text="Приложение запускается…" Foreground="#D6DAE2" FontSize="14" Margin="0,16,0,0" HorizontalAlignment="Center"/>
         </StackPanel>
@@ -806,6 +922,7 @@ $loaderTitle   = $loader.FindName('LoaderTitle')
 $loaderSub     = $loader.FindName('LoaderSub')
 $loaderElapsed = $loader.FindName('LoaderElapsed')
 $loaderBar     = $loader.FindName('LoaderBar')
+$loaderIcon    = $loader.FindName('LoaderIcon')
 $showWindowBtn = $loader.FindName('ShowWindowBtn')
 $hideLoaderBtn = $loader.FindName('HideLoaderBtn')
 
@@ -840,6 +957,13 @@ function Show-InternalError([string]$Text) {
         $script:lastErrorText = $Text
         $script:lastErrorAt = $now
         Set-Footer "Ошибка: $Text"
+    } catch { }
+}
+
+function Set-WinoidDarkTitleBar($Window) {
+    try {
+        $helper = [System.Windows.Interop.WindowInteropHelper]::new($Window)
+        [NativeWin]::UseDarkTitleBar($helper.Handle)
     } catch { }
 }
 
@@ -1340,14 +1464,44 @@ function Get-LauncherApps {
             $name = $matches[1].Trim()
             $pkg = $matches[2].Trim()
             if (-not $byPackage.ContainsKey($pkg)) {
-                $byPackage[$pkg] = [pscustomobject]@{ Name = $name; Package = $pkg }
+                $appItem = [pscustomobject]@{ Name = $name; Package = $pkg }
+                # Real extracted icon (BitmapFrame) instead of the "A" placeholder.
+                $appItem | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $appItem) -Force
+                $byPackage[$pkg] = $appItem
             }
         }
     }
-    return @($byPackage.Values | Sort-Object Name)
+    $apps = @($byPackage.Values | Sort-Object Name)
+    if ($apps.Count -gt 0) {
+        # Remember a good list so it can still be shown while Waydroid is
+        # frozen/suspended and its helper cannot answer.
+        try {
+            $plain = @($apps | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Package = $_.Package } })
+            $cache = Join-Path $script:dataRoot 'apps.json'
+            [System.IO.File]::WriteAllText($cache, ($plain | ConvertTo-Json -Depth 3 -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        } catch { }
+    }
+    return $apps
+}
+
+function Get-CachedLauncherApps {
+    $cache = Join-Path $script:dataRoot 'apps.json'
+    if (-not (Test-Path -LiteralPath $cache)) { return @() }
+    try {
+        $items = @(Get-Content -LiteralPath $cache -Raw -Encoding utf8 | ConvertFrom-Json)
+        $result = New-Object System.Collections.ArrayList
+        foreach ($it in $items) {
+            if ([string]::IsNullOrWhiteSpace([string]$it.Package)) { continue }
+            $app = [pscustomobject]@{ Name = [string]$it.Name; Package = [string]$it.Package }
+            $app | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $app) -Force
+            [void]$result.Add($app)
+        }
+        return @($result)
+    } catch { return @() }
 }
 
 function Refresh-Apps {
+    $script:iconAdbOffline = $false
     if (-not (Test-Backend)) {
         $script:apps = @()
         Update-AppFilter
@@ -1373,10 +1527,21 @@ function Refresh-Apps {
                 [void]$list.Add([pscustomobject]@{ Name = $name; Package = $pkg })
             }
             $script:apps = @($list | Sort-Object Name)
+            foreach ($app in $script:apps) {
+                $app | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $app) -Force
+            }
         }
     }
 
     if ($script:apps.Count -eq 0) {
+        # Waydroid freezes when idle; the DEX helper cannot answer then.
+        # Show the last good list with its cached icons instead of an empty one.
+        $script:apps = @(Get-CachedLauncherApps)
+        if ($script:apps.Count -gt 0) {
+            Update-AppFilter
+            Set-Footer 'Список приложений из кэша (Android не отвечает)'
+            return
+        }
         Update-AppFilter
         Set-Footer 'Список пуст. Android ещё запускается? Нажмите «Обновить».'
         return
@@ -1473,6 +1638,60 @@ function Send-Android([string]$cmd) {
     try { $script:adb.Send($cmd) } catch { }
 }
 
+# Back only reaches the app that owns Android's input focus. Launching a
+# second app can steal that focus while the Settings wrapper stays visible,
+# and ADB key events go to the focused window, not to the one on screen.
+# Tapping the freeform caption's empty middle focuses Settings without
+# touching app content; then the plain Back key reaches the right window.
+function Send-AndroidBack($w) {
+    if ($null -eq $w) { return }
+    if ($w.Package -eq 'com.android.settings') {
+        # Back on the root list leaves Settings; close the wrapper instead of
+        # backgrounding the app behind an orphaned window showing a still frame.
+        if ([string]$w.SettingsTop -match '\.Settings$') {
+            try { Write-WinoidLog 'nav back closes settings' } catch { }
+            try { $w.Window.Close() } catch { }
+            return
+        }
+        $bx = [int]$w.FrameL + [int]($w.FrameW / 2)
+        $by = [int]$w.FrameT + 22
+        Send-Android "input tap $bx $by"
+        Start-Sleep -Milliseconds 180
+        Send-Android 'input keyevent 4'
+        $w.SettingsTopDue = [DateTime]::UtcNow.AddMilliseconds(1200)
+        try { Write-WinoidLog "nav back focus $bx,$by + keyevent" } catch { }
+        return
+    }
+    Send-Android 'input keyevent 4'
+}
+
+function Get-AndroidTopActivity {
+    if ($null -eq $script:adb -or -not $script:adb.Running) { Initialize-Adb }
+    if ($null -eq $script:adb -or -not $script:adb.Running) { return '' }
+    try {
+        $text = [string]$script:adb.SendQuery('dumpsys activity activities | grep topResumedActivity | head -1', 2500)
+    } catch { return '' }
+    if ($text -match '([\w\.]+/[\w\.\$]+)') { return $matches[1] }
+    return ''
+}
+
+# Settings keeps the previous activity alive below the current one. After
+# Back the old sub-surface can stay on top of the list with a stale picture,
+# so Sync-SettingsSurface prefers the root window when Android reports it.
+
+# Ask Android which activity is on top and remember it; the frame timer then
+# calls Sync-SettingsSurface, which picks the matching WSLg surface. Window
+# z-order alone lies after Back: the finished detail surface can stay above
+# the list with a frozen picture.
+function Update-SettingsActivity($w) {
+    if ($null -eq $w -or $w.Closed -or $w.Package -ne 'com.android.settings') { return }
+    $top = Get-AndroidTopActivity
+    if ([string]::IsNullOrWhiteSpace($top)) { return }
+    $w.SettingsTop = $top
+    try { Write-WinoidLog "settings top $top" } catch { }
+    $w.SettingsSyncAt = [DateTime]::MinValue
+}
+
 # --- wrappers ---
 
 function Find-WrapperByPackage([string]$package) {
@@ -1560,29 +1779,11 @@ function Get-AppPanes($app, [IntPtr]$source) {
     $panes = New-Object System.Collections.ArrayList
     [void]$panes.Add([pscustomobject]@{ Source = $source; Left = $wr.Left; Top = $wr.Top; W = $pw; H = $ph })
 
-    if ($app.Package -eq 'com.android.settings') {
-        $companion = $null
-        foreach ($wnd in $wins) {
-            if (-not $wnd.Visible -or $wnd.Hwnd -eq $source) { continue }
-            if ($wnd.Title -notmatch 'sub-surface') { continue }
-            $ww = $wnd.Width; $wh = $wnd.Height
-            if ($ww -lt 200 -or [math]::Abs($wh - $ph) -gt 12) { continue }
-            if ($displayW -gt 0 -and [math]::Abs(($pw + $ww) - $displayW) -gt 48) { continue }
-            if ($displayW -gt 0 -and $ww -ge $displayW - 48) { continue }
-            if ($null -eq $companion -or $ww -gt $companion.Width) { $companion = $wnd }
-        }
-        if ($null -ne $companion) {
-            $ccr = New-Object NativeWin+RECT
-            [void][NativeWin]::GetClientRect($companion.Hwnd, [ref]$ccr)
-            [void]$panes.Add([pscustomobject]@{
-                Source = $companion.Hwnd
-                Left = $wr.Left + $pw
-                Top = $wr.Top
-                W = [Math]::Max(1, $ccr.Right)
-                H = [Math]::Max(1, $ccr.Bottom)
-            })
-        }
-    }
+    # Settings opens every sub-screen as a new Android activity in the same
+    # freeform frame. WSLg gives each activity its own overlapping surface
+    # instead of a side-by-side list/detail pair, so the wrapper follows the
+    # topmost surface at this frame (see Sync-SettingsSurface). Capturing both
+    # at once would freeze on the old list while the detail pane is showing.
 
     $minLeft = $wr.Left; $minTop = $wr.Top
     $maxRight = $wr.Left + $pw; $maxBottom = $wr.Top + $ph
@@ -1670,6 +1871,224 @@ function Set-PaneAndroidFrames($panes, $frames) {
     }
 }
 
+# WSLg sometimes stacks an empty black sub-surface above a real Settings
+# window. PrintWindow cannot tell it from content, so sample a frame before
+# switching: a nearly black overlay must not replace the visible list.
+function Get-WindowLuma([IntPtr]$hwnd, [int]$ww, [int]$hh) {
+    $g = $null
+    try {
+        $g = [FrameGrabber]::new([Math]::Max(1, $ww), [Math]::Max(1, $hh))
+        if (-not $g.Capture($hwnd)) { return -1 }
+        return $g.MeanLuma()
+    } catch { return -1 }
+    finally { if ($null -ne $g) { try { $g.Dispose() } catch { } } }
+}
+
+# Locate the Android content rectangle inside a WSLg surface. Returns
+# @(offsetX, offsetY) or $null when the capture failed.
+function Get-WindowContentOffset([IntPtr]$hwnd, [int]$ww, [int]$hh, [int]$cw, [int]$ch) {
+    $g = $null
+    try {
+        $g = [FrameGrabber]::new([Math]::Max(1, $ww), [Math]::Max(1, $hh))
+        if (-not $g.Capture($hwnd)) { return $null }
+        $ox = 0; $oy = 0
+        if ($g.FindContentOffset($cw, $ch, [ref]$ox, [ref]$oy)) { return @([int]$ox, [int]$oy) }
+        return $null
+    } catch { return $null }
+    finally { if ($null -ne $g) { try { $g.Dispose() } catch { } } }
+}
+
+# Settings switches activities inside one freeform frame (list -> "Network",
+# "Apps", ...). Each activity is a separate WSLg surface stacked at the same
+# place, and the previous one stays alive underneath. Follow the topmost
+# surface so taps, Back and the captured image all describe the screen the
+# user is actually looking at instead of freezing on the first list pane.
+function Sync-SettingsSurface($w) {
+    if ($null -eq $w -or $w.Closed -or $w.Package -ne 'com.android.settings') { return }
+    $tw = [int]$w.SettingsW; $th = [int]$w.SettingsH
+    if ($tw -lt 100 -or $th -lt 100) { return }
+
+    $anchor = $null
+    foreach ($p in @($w.Panes)) {
+        if ($null -ne $p -and [NativeWin]::IsWindow($p.Source)) { $anchor = $p.Source; break }
+    }
+    if ($null -eq $anchor) { return }
+    $procId = [uint32]0
+    [void][NativeWin]::GetWindowThreadProcessId($anchor, [ref]$procId)
+    $wins = @()
+    try { $wins = @([NativeWin]::ListWindows($procId)) } catch { return }
+    # msrdc hosts every WSLg app window in one process, so a size filter
+    # alone would let another app's surface (a calculator is also 464x824)
+    # hijack the Settings wrapper. Sub-surfaces are owned by their app's
+    # base window; keep only the Settings root-owner family.
+    $ownerRoot = [NativeWin]::GetAncestor($anchor, 3)
+
+    # EnumWindows returns top-level windows top-to-bottom.
+    $candidates = @()
+    foreach ($wnd in $wins) {
+        if (-not $wnd.Visible) { continue }
+        if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $ownerRoot) { continue }
+        if ($wnd.Width -lt 240 -or $wnd.Height -lt 240) { continue }
+        if ([math]::Abs($wnd.Width - $tw) -gt 48 -or [math]::Abs($wnd.Height - $th) -gt 48) { continue }
+        $candidates += $wnd
+    }
+    if ($candidates.Count -eq 0) { return }
+
+    $cur = $null
+    foreach ($p in @($w.Panes)) { if ($null -ne $p) { $cur = $p; break } }
+    $topAct = ''
+    try { $topAct = [string]$w.SettingsTop } catch { }
+    $rootTop = ($topAct -match 'com\.android\.settings/\.Settings$')
+
+    $active = $candidates[0]
+    if ($rootTop) {
+        # Back returned to the root list. The finished detail surface often
+        # stays on top with a frozen picture, so prefer the base window.
+        foreach ($cand in $candidates) {
+            if ($cand.Title -notmatch 'sub-surface') { $active = $cand; break }
+        }
+    } elseif ([string]::IsNullOrWhiteSpace($topAct) -and ($null -eq $cur -or $cur.Source -ne $active.Hwnd)) {
+        # Top activity unknown (fresh launch): a blank overlay sub-surface
+        # must not replace the visible list.
+        $topLuma = Get-WindowLuma $active.Hwnd $active.Width $active.Height
+        if ($topLuma -lt 0.5) {
+            foreach ($cand in $candidates) {
+                if ($cand.Title -notmatch 'sub-surface') { $active = $cand; break }
+            }
+        }
+    }
+    $parkBase = [System.Windows.Forms.SystemInformation]::VirtualScreen.Right + 200
+    if ($null -ne $w.PSObject.Properties['ParkBase']) { $parkBase = [int]$w.ParkBase }
+
+    # Android sets a 12 px surface inset on each side of the Settings base
+    # window. If WSLg made it content-sized, grow it back so the full 464 px
+    # content is rendered instead of clipped at the right edge. Do this even
+    # when the wrapper already shows that window, hence the size check below.
+    $isBaseWin = ([NativeWin]::GetWindow($active.Hwnd, 4) -eq [IntPtr]::Zero)
+    if ($isBaseWin -and ([int]$active.Width -lt [int]$w.FrameW + 16 -or [int]$active.Height -lt [int]$w.FrameH + 16)) {
+        $targetW = [int]$w.FrameW + 24; $targetH = [int]$w.FrameH + 24
+        [void][NativeWin]::SetWindowPos($active.Hwnd, [IntPtr]::Zero, $parkBase, 0, $targetW, $targetH, 0x0016)
+        [System.Threading.Thread]::Sleep(350)
+        $active | Add-Member -NotePropertyName Width -NotePropertyValue $targetW -Force
+        $active | Add-Member -NotePropertyName Height -NotePropertyValue $targetH -Force
+    }
+    $needSwitch = ($null -eq $cur -or $cur.Source -ne $active.Hwnd -or [int]$cur.W -ne [int]$active.Width -or [int]$cur.H -ne [int]$active.Height)
+    if ($needSwitch) {
+        try {
+            $diag = @($candidates | ForEach-Object {
+                $name = $_.Title
+                if ($name.Length -gt 28) { $name = $name.Substring(0, 28) }
+                "$('0x{0:X}' -f $_.Hwnd.ToInt64())=$name/$($_.Width)x$($_.Height)"
+            }) -join '; '
+            Write-WinoidLog ("settings candidates: $diag top=$topAct")
+        } catch { }
+    }
+
+    # Park every other app-sized Settings surface (the old activity stays
+    # alive underneath the new one and must not float over the desktop).
+    foreach ($wnd in $wins) {
+        if ($null -eq $wnd -or -not $wnd.Visible -or $wnd.Hwnd -eq $active.Hwnd) { continue }
+        if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $ownerRoot) { continue }
+        if ($null -ne $cur -and $wnd.Hwnd -eq $cur.Source) { continue }
+        if ($wnd.Width -lt 240 -or $wnd.Height -lt 240) { continue }
+        if ([math]::Abs($wnd.Width - $tw) -gt 48 -or [math]::Abs($wnd.Height - $th) -gt 48) { continue }
+        $known = $false
+        foreach ($p in @($w.Parked)) { if ($null -ne $p -and $p.Source -eq $wnd.Hwnd) { $known = $true; break } }
+        if ($known) { continue }
+        $ex = [NativeWin]::GetWindowLong($wnd.Hwnd, -20)
+        $rect = New-Object NativeWin+RECT
+        [void][NativeWin]::GetWindowRect($wnd.Hwnd, [ref]$rect)
+        $parkExp = (($ex -bor 0x00000080) -band (-bnot 0x00040000))
+        [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, $parkExp)
+        $parkX = $parkBase + [Math]::Max(0, $wnd.Left - [int]$w.Left)
+        [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, $parkX, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
+        [void]$w.Parked.Add([pscustomobject]@{
+            Source = $wnd.Hwnd
+            OrigExStyle = (($ex -bor 0x00040000) -band (-bnot 0x00000080))
+            OrigRect = $rect
+            WasZoomed = $false
+            ParkX = $parkX
+            ParkY = 0
+            W = [int]$wnd.Width
+            H = [int]$wnd.Height
+        })
+    }
+
+    if (-not $needSwitch) { return }
+
+    if ($null -ne $cur) {
+        try { $cur.Grab.Dispose() } catch { }
+        if ([NativeWin]::IsWindow($cur.Source)) {
+            [void]$w.Parked.Add([pscustomobject]@{
+                Source = $cur.Source
+                OrigExStyle = $cur.OrigExStyle
+                OrigRect = $cur.OrigRect
+                WasZoomed = $cur.WasZoomed
+                ParkX = $cur.ParkX
+                ParkY = $cur.ParkY
+                W = $cur.W
+                H = $cur.H
+            })
+        }
+    }
+
+    $ex = [NativeWin]::GetWindowLong($active.Hwnd, -20)
+    $rect = New-Object NativeWin+RECT
+    [void][NativeWin]::GetWindowRect($active.Hwnd, [ref]$rect)
+    $zoom = [NativeWin]::IsZoomed($active.Hwnd)
+    if ($zoom) {
+        [void][NativeWin]::ShowWindow($active.Hwnd, 9)
+        for ($i = 0; $i -lt 20 -and [NativeWin]::IsZoomed($active.Hwnd); $i++) { [System.Threading.Thread]::Sleep(25) }
+    }
+    $parkedEx = (($ex -bor 0x00000080) -band (-bnot 0x00040000))
+    [void][NativeWin]::SetWindowLong($active.Hwnd, -20, $parkedEx)
+    # Android sets a 12 px surface inset on each side of the Settings base
+    # window. If WSLg made it content-sized, grow it back so the full 464 px
+    # content is rendered instead of clipped at the right edge.
+    $parkW = [int]$active.Width; $parkH = [int]$active.Height
+    $isBaseWin = ([NativeWin]::GetWindow($active.Hwnd, 4) -eq [IntPtr]::Zero)
+    if ($isBaseWin -and ($parkW -lt [int]$w.FrameW + 16 -or $parkH -lt [int]$w.FrameH + 16)) {
+        $parkW = [int]$w.FrameW + 24; $parkH = [int]$w.FrameH + 24
+    }
+    [void][NativeWin]::SetWindowPos($active.Hwnd, [IntPtr]::Zero, $parkBase, 0, $parkW, $parkH, 0x0010)
+    if ($parkW -ne [int]$active.Width -or $parkH -ne [int]$active.Height) {
+        [System.Threading.Thread]::Sleep(350)
+        $active | Add-Member -NotePropertyName Width -NotePropertyValue $parkW -Force
+        $active | Add-Member -NotePropertyName Height -NotePropertyValue $parkH -Force
+    }
+
+    # The Android frame keeps its origin. Find the content rectangle inside
+    # the WSLg surface so shadow margins never leak into the wrapper image.
+    $off = Get-WindowContentOffset $active.Hwnd ([int]$active.Width) ([int]$active.Height) ([int]$w.FrameW) ([int]$w.FrameH)
+    $cropX = 0; $cropY = 0
+    if ($null -ne $off) {
+        $cropX = [int]$off[0]; $cropY = [int]$off[1]
+    } else {
+        if ([int]$active.Width -ge [int]$w.FrameW + 8) { $cropX = [int][Math]::Round(([int]$active.Width - [int]$w.FrameW) / 2) }
+        if ([int]$active.Height -ge [int]$w.FrameH + 8) { $cropY = [int][Math]::Round(([int]$active.Height - [int]$w.FrameH) / 2) }
+    }
+    $al = [int]$w.FrameL; $at = [int]$w.FrameT
+
+    $pane = [pscustomobject]@{ Source = $active.Hwnd; Left = 0; Top = 0; W = [int]$active.Width; H = [int]$active.Height }
+    $pane | Add-Member -NotePropertyName CropX -NotePropertyValue $cropX -Force
+    $pane | Add-Member -NotePropertyName CropY -NotePropertyValue $cropY -Force
+    $pane | Add-Member -NotePropertyName VX -NotePropertyValue 0 -Force
+    $pane | Add-Member -NotePropertyName VY -NotePropertyValue 0 -Force
+    $pane | Add-Member -NotePropertyName VisH -NotePropertyValue ([Math]::Min([int]$active.Height, [int]$w.SrcH)) -Force
+    $pane | Add-Member -NotePropertyName OrigExStyle -NotePropertyValue (($ex -bor 0x00040000) -band (-bnot 0x00000080)) -Force
+    $pane | Add-Member -NotePropertyName OrigRect -NotePropertyValue $rect -Force
+    $pane | Add-Member -NotePropertyName WasZoomed -NotePropertyValue $zoom -Force
+    $pane | Add-Member -NotePropertyName Grab -NotePropertyValue ([FrameGrabber]::new([int]$active.Width, [int]$active.Height)) -Force
+    $pane | Add-Member -NotePropertyName ParkX -NotePropertyValue $parkBase -Force
+    $pane | Add-Member -NotePropertyName ParkY -NotePropertyValue 0 -Force
+    $pane | Add-Member -NotePropertyName AndroidL -NotePropertyValue $al -Force
+    $pane | Add-Member -NotePropertyName AndroidT -NotePropertyValue $at -Force
+
+    $w.Panes = @($pane)
+    $w.Source = $active.Hwnd
+    try { Write-WinoidLog ("settings surface $('0x{0:X}' -f $active.Hwnd.ToInt64()) $($active.Width)x$($active.Height)") } catch { }
+}
+
 function Restore-Source($w) {
     foreach ($pane in (@($w.Panes) + @($w.Parked))) {
         if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
@@ -1696,6 +2115,13 @@ function Remove-Wrapper($w, [bool]$closeSource) {
         foreach ($pane in @($w.Panes)) {
             if ($null -ne $pane -and [NativeWin]::IsWindow($pane.Source)) {
                 [void][NativeWin]::PostMessage($pane.Source, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            }
+        }
+        # Settings keeps the previous activity alive under the current one.
+        # Close those parked surfaces too, otherwise they linger off-screen.
+        foreach ($extra in @($w.Parked)) {
+            if ($null -ne $extra -and [NativeWin]::IsWindow($extra.Source)) {
+                [void][NativeWin]::PostMessage($extra.Source, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
             }
         }
     }
@@ -1728,6 +2154,58 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     # translated to the right place instead of the top-left of Android.
     $androidFrames = @(Get-AndroidWindowFrames $app.Package)
     Set-PaneAndroidFrames $panes $androidFrames
+    # Settings is one Android window whose height is the freeform frame, not
+    # the WSLg shadowed surface. Use the frame size for the wrapper so the
+    # window keeps phone-like proportions instead of a 488x848 shadow box.
+    $settingsFrame = $null
+    if ($app.Package -eq 'com.android.settings' -and $androidFrames.Count -gt 0) {
+        $frameDelta = 99999
+        foreach ($f in $androidFrames) {
+            $d = [math]::Abs($srcW - [int]$f.W) + [math]::Abs($srcH - [int]$f.H)
+            if ($d -lt $frameDelta) { $settingsFrame = $f; $frameDelta = $d }
+        }
+        if ($null -ne $settingsFrame -and [int]$settingsFrame.W -gt 100 -and [int]$settingsFrame.H -gt 100) {
+            $srcW = [int]$settingsFrame.W
+            $srcH = [int]$settingsFrame.H
+        }
+    }
+    foreach ($pane in $panes) {
+        $pane | Add-Member -NotePropertyName CropX -NotePropertyValue 0 -Force
+        $pane | Add-Member -NotePropertyName CropY -NotePropertyValue 0 -Force
+    }
+    # WSLg often adds a translucent shadow around a surface, but it is not
+    # always centered: unparked windows sometimes keep all 24 px on the
+    # right/bottom. Locate the Android content rectangle inside the capture
+    # instead of assuming a fixed margin.
+    if ($app.Package -eq 'com.android.settings' -and $panes.Count -gt 0 -and $null -ne $settingsFrame) {
+        $p0 = $panes[0]
+        # Android asks for a 464x824 content window and a 12 px surface inset
+        # on every side. WSLg occasionally creates just the content-sized
+        # window and clips the right edge; restore the full surface first.
+        $isBase = ([NativeWin]::GetWindow($p0.Source, 4) -eq [IntPtr]::Zero)
+        try { Write-WinoidLog "settings create base=$isBase pane=$($p0.W)x$($p0.H) src=${srcW}x${srcH}" } catch { }
+        if ($isBase -and ([int]$p0.W -lt $srcW + 16 -or [int]$p0.H -lt $srcH + 16)) {
+            [void][NativeWin]::SetWindowPos($p0.Source, [IntPtr]::Zero, 0, 0, $srcW + 24, $srcH + 24, 0x0006)
+            [System.Threading.Thread]::Sleep(350)
+            $cr2 = New-Object NativeWin+RECT
+            [void][NativeWin]::GetClientRect($p0.Source, [ref]$cr2)
+            if ($cr2.Right -ge $srcW) { $p0.W = [int]$cr2.Right }
+            if ($cr2.Bottom -ge $srcH) { $p0.H = [int]$cr2.Bottom }
+        }
+        $off = $null
+        if ([int]$p0.W -ge $srcW -and [int]$p0.H -ge $srcH) {
+            $off = Get-WindowContentOffset $p0.Source ([int]$p0.W) ([int]$p0.H) $srcW $srcH
+        }
+        if ($null -ne $off) {
+            $p0.CropX = [int]$off[0]
+            $p0.CropY = [int]$off[1]
+        } else {
+            if ([int]$p0.W -ge $srcW + 8) { $p0.CropX = [int][Math]::Round(([int]$p0.W - $srcW) / 2) }
+            if ([int]$p0.H -ge $srcH + 8) { $p0.CropY = [int][Math]::Round(([int]$p0.H - $srcH) / 2) }
+        }
+        $p0 | Add-Member -NotePropertyName AndroidL -NotePropertyValue ([int]$settingsFrame.L) -Force
+        $p0 | Add-Member -NotePropertyName AndroidT -NotePropertyValue ([int]$settingsFrame.T) -Force
+    }
     try {
         $paneInfo = @($panes | ForEach-Object {
             $al = $_.PSObject.Properties['AndroidL']; $at = $_.PSObject.Properties['AndroidT']
@@ -1828,15 +2306,37 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.SrcW = $srcW
     $w.SrcH = $srcH
     $w.NavInset = $spec.NavInset
-    $w.Panes = $panes
-    $w.Parked = @($parked)
+    $w.Panes = @($panes)
+    # Keep the ArrayList so Sync-SettingsSurface can park newly opened
+    # activities; @() would turn it into a fixed-size array.
+    $w.Parked = $parked
+    $w.ParkBase = $parkBase
+    $w.SettingsW = $srcW
+    $w.SettingsH = $srcH
+    $w.SettingsSyncAt = [DateTime]::MinValue
+    # A new Settings wrapper always starts on the root list, even if a stale
+    # sub-surface from an earlier session is still above it.
+    $w.SettingsTop = 'com.android.settings/.Settings'
+    $w.SettingsTopDue = $null
+    $w.FrameL = 0; $w.FrameT = 0; $w.FrameW = $srcW; $w.FrameH = $srcH
+    if ($null -ne $settingsFrame) {
+        $w.FrameL = [int]$settingsFrame.L
+        $w.FrameT = [int]$settingsFrame.T
+        $w.FrameW = [int]$settingsFrame.W
+        $w.FrameH = [int]$settingsFrame.H
+    }
     $w.Closed = $false
     $w.Settled = $false
     $w.LoadPhase = 0
     $w.LoadStart = [DateTime]::UtcNow
     $w.Frames = 0
     $w.DragX = 0; $w.DragY = 0; $w.DragT = [DateTime]::MinValue
+    $w.DownX = 0; $w.DownY = 0; $w.Dragging = $false; $w.DragSent = $false
     $w.LastMoveT = [DateTime]::MinValue
+    $w.LoadingIcon = $null
+    # The onboarding hint covers game UI until the first tap; hide it by
+    # itself after a few seconds so screenshots and idle windows stay clean.
+    $w.HintUntil = [DateTime]::UtcNow.AddSeconds(8)
 
     $win = [System.Windows.Markup.XamlReader]::Parse($script:wrapperXaml)
     $win.Title = "$displayName — Winoid"
@@ -1845,9 +2345,11 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $hint = $win.FindName('Hint')
     $loading = $win.FindName('Loading')
     $loadingText = $win.FindName('LoadingText')
+    $loadingIcon = $win.FindName('LoadingIcon')
     $backBtn = $win.FindName('BackBtn')
     $homeBtn = $win.FindName('HomeBtn')
     $recentsBtn = $win.FindName('RecentsBtn')
+    $navLabel = $win.FindName('NavLabel')
 
     $wb = New-Object System.Windows.Media.Imaging.WriteableBitmap($srcW, $srcH, 96, 96, [System.Windows.Media.PixelFormats]::Bgr32, $null)
     $image.Source = $wb
@@ -1857,7 +2359,15 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.Hint = $hint
     $w.Loading = $loading
     $w.LoadingText = $loadingText
+    $w.LoadingIcon = $loadingIcon
     $w.Wb = $wb
+
+    if ($null -ne $loadingIcon) { $loadingIcon.Source = $script:appIcon }
+
+    $win.Add_SizeChanged({
+        param($sender, $e)
+        try { $navLabel.Visibility = $(if ($sender.ActualWidth -lt 560) { 'Collapsed' } else { 'Visible' }) } catch { }
+    })
 
     $image.Add_MouseLeftButtonDown({
         param($sender, $e)
@@ -1869,12 +2379,14 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             $pText = if ($null -ne $p) { "$($p[0]),$($p[1])" } else { "null" }
             Write-WinoidLog ("click " + $w.Package + " raw=" + [int]$raw.X + "," + [int]$raw.Y + " mapped=" + $pText)
             if ($null -eq $p) { return }
-            # Do not move foreground to the WSLg source here: WPF would lose
-            # mouse capture before MouseLeftButtonUp, leaving Android with a
-            # stuck DOWN and no tap. The activation timer restores focus to
-            # the source after the click.
-            Send-Android "input motionevent DOWN $($p[0]) $($p[1])"
-            $w.DragX = $p[0]; $w.DragY = $p[1]; $w.DragT = [DateTime]::UtcNow
+            # Defer Android input until we know whether this is a tap or a
+            # drag. A zero-length motionevent DOWN/UP pair is unreliable and
+            # often leaves the app seeing only a pressed row; "input tap" is
+            # what a real finger click does.
+            $w.DownX = $p[0]; $w.DownY = $p[1]
+            $w.Dragging = $false
+            $w.DragSent = $false
+            $w.LastMoveT = [DateTime]::MinValue
             $w.Hint.Visibility = 'Collapsed'
             [void]$sender.CaptureMouse()
         } catch {
@@ -1889,11 +2401,17 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             if ($e.LeftButton -ne 'Pressed') { return }
             $p = Map-WrapperPoint $w $e.GetPosition($sender)
             if ($null -eq $p) { return }
-            if ([math]::Abs($p[0] - $w.DragX) -lt 3 -and [math]::Abs($p[1] - $w.DragY) -lt 3) { return }
+            if (-not $w.Dragging) {
+                if ([math]::Abs($p[0] - $w.DownX) -lt 8 -and [math]::Abs($p[1] - $w.DownY) -lt 8) { return }
+                $w.Dragging = $true
+            }
+            if (-not $w.DragSent) {
+                Send-Android "input motionevent DOWN $($w.DownX) $($w.DownY)"
+                $w.DragSent = $true
+            }
             $now = [DateTime]::UtcNow
             if (($now - $w.LastMoveT).TotalMilliseconds -lt 45) { return }
             $w.LastMoveT = $now
-            $w.DragX = $p[0]; $w.DragY = $p[1]
             Send-Android "input motionevent MOVE $($p[0]) $($p[1])"
         } catch { }
     })
@@ -1903,8 +2421,23 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         if ($null -eq $w -or $w.Closed) { return }
         try {
             $p = Map-WrapperPoint $w $e.GetPosition($sender)
-            if ($null -eq $p) { return }
-            Send-Android "input motionevent UP $($p[0]) $($p[1])"
+            if ($w.Dragging -and $w.DragSent) {
+                if ($null -eq $p) { $p = @([int]$w.DownX, [int]$w.DownY) }
+                Send-Android "input motionevent UP $($p[0]) $($p[1])"
+            } elseif (-not $w.Dragging) {
+                Send-Android "input tap $($w.DownX) $($w.DownY)"
+                if ($w.Package -eq 'com.android.settings') {
+                    $w.SettingsTopDue = [DateTime]::UtcNow.AddMilliseconds(900)
+                }
+            }
+            $w.Dragging = $false; $w.DragSent = $false
+            # Hand keyboard focus to the hidden Android window only after a
+            # real tap in the image. Doing this on every activation would
+            # cancel title-bar drags and double clicks, so the window could
+            # not be resized or maximized.
+            $script:bounceWrap = $w
+            $script:bounceTimer.Stop()
+            $script:bounceTimer.Start()
             [void]$sender.ReleaseMouseCapture()
         } catch { }
     })
@@ -1927,7 +2460,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             if ($null -eq $w -or $w.Closed) { return }
             [NativeWin]::ForceForeground($w.Source)
             [System.Threading.Thread]::Sleep(120)
-            Send-Android 'input keyevent 4'
+            Send-AndroidBack $w
         } catch { }
     })
     $homeBtn.Add_Click({
@@ -1967,20 +2500,14 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             if ($keyCode -ne 0) {
                 $e.Handled = $true
                 [NativeWin]::ForceForeground($w.Source)
-                Send-Android "input keyevent $keyCode"
+                if ($keyCode -eq 4) { Send-AndroidBack $w }
+                else { Send-Android "input keyevent $keyCode" }
             }
         }
     })
-    $win.Add_Activated({
-        param($sender, $e)
-        Invoke-Safe 'wrapper.activated' {
-            $w = $script:wrapByWindow[$sender]
-            if ($null -eq $w -or $w.Closed) { return }
-            $script:bounceWrap = $w
-            $script:bounceTimer.Stop()
-            $script:bounceTimer.Start()
-        }
-    })
+    # Focus goes back to the Android surface only after a tap in the image
+    # (see MouseLeftButtonUp). Bouncing on every activation used to steal focus
+    # during title-bar drags, so wrapper windows could not be resized.
     $win.Add_Closing({
         param($sender, $e)
         Invoke-Safe 'wrapper.closing' {
@@ -2010,6 +2537,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $win.Width = $cw + 16
     $win.Height = $ch + $script:wrapperNavHeight + 39
     $win.Show()
+    Set-WinoidDarkTitleBar $win
     $win.UpdateLayout()
     Focus-Wrapper $w
     try {
@@ -2033,7 +2561,7 @@ $script:bounceTimer.Add_Tick({
         $script:bounceTimer.Stop()
         $w = $script:bounceWrap
         if ($null -eq $w -or $w.Closed) { return }
-        if ($w.Window.IsActive -and $w.Window.WindowState -ne 'Minimized' -and [System.Windows.Input.Mouse]::LeftButton -eq 'Released') {
+        if ($w.Window.IsActive -and $w.Window.WindowState -ne 'Minimized' -and -not [NativeWin]::LeftButtonDown()) {
             [NativeWin]::ForceForeground($w.Source)
         }
     } catch {
@@ -2056,6 +2584,20 @@ $script:frameTimer.Add_Tick({
                 if ($null -ne $pane -and [NativeWin]::IsWindow($pane.Source)) { $alive = $true; break }
             }
             if (-not $alive) { Remove-Wrapper $w $false; continue }
+            if ($w.Package -eq 'com.android.settings') {
+                if ($null -ne $w.SettingsTopDue -and [DateTime]::UtcNow -ge $w.SettingsTopDue) {
+                    $w.SettingsTopDue = $null
+                    Update-SettingsActivity $w
+                }
+                if (([DateTime]::UtcNow - $w.SettingsSyncAt).TotalMilliseconds -ge 350) {
+                    $w.SettingsSyncAt = [DateTime]::UtcNow
+                    Sync-SettingsSurface $w
+                }
+            }
+            if ($null -ne $w.HintUntil -and [DateTime]::UtcNow -ge $w.HintUntil) {
+                $w.Hint.Visibility = 'Collapsed'
+                $w.HintUntil = $null
+            }
             $capture = ($w.Window.IsVisible -and $w.Window.WindowState -ne 'Minimized')
             $lumaSum = 0.0
             $lumaRows = 0
@@ -2071,12 +2613,21 @@ $script:frameTimer.Add_Tick({
                     [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $pane.ParkX, $pane.ParkY, $pane.W, $pane.H, 0x0010)
                 }
                 if (-not $capture) { continue }
+                # A WSLg shadow can make the surface a few pixels larger than
+                # the Android frame; crop it and never write outside the
+                # wrapper bitmap.
+                $cx = 0; $cy = 0
+                $cxp = $pane.PSObject.Properties['CropX']; $cyp = $pane.PSObject.Properties['CropY']
+                if ($null -ne $cxp) { $cx = [int]$cxp.Value }
+                if ($null -ne $cyp) { $cy = [int]$cyp.Value }
+                $vw = [Math]::Min([int]$pane.W - $cx, [int]$w.SrcW - [int]$pane.VX)
+                $vh = [Math]::Min([int]$pane.VisH - $cy, [int]$w.SrcH - [int]$pane.VY)
+                if ($vw -lt 1 -or $vh -lt 1) { continue }
                 [void]$pane.Grab.Capture($pane.Source)
-                $rect = [System.Windows.Int32Rect]::new([int]$pane.VX, [int]$pane.VY, [int]$pane.W, [int]$pane.VisH)
-                $bytes = [int]($pane.Grab.Stride * $pane.VisH)
-                $w.Wb.WritePixels($rect, $pane.Grab.Bits, $bytes, $pane.Grab.Stride)
-                $lumaSum += $pane.Grab.MeanLuma() * $pane.VisH
-                $lumaRows += $pane.VisH
+                $srcRect = [System.Windows.Int32Rect]::new($cx, $cy, $vw, $vh)
+                $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
+                $lumaSum += $pane.Grab.MeanLuma() * $vh
+                $lumaRows += $vh
             }
             foreach ($extra in @($w.Parked)) {
                 if ($null -eq $extra -or -not [NativeWin]::IsWindow($extra.Source)) { continue }
@@ -2147,13 +2698,22 @@ $launchTimer.Add_Tick({
     if ($h -ne [IntPtr]::Zero) {
         $st.Hwnd = $h
         if (-not $st.Wrapped) {
+            # Settings now uses one Android frame, so there is no second
+            # side-by-side pane to wait for; Sync-SettingsSurface follows
+            # sub-screens after the wrapper exists. On a fresh boot Settings
+            # briefly paints a wide tablet layout before Android applies the
+            # freeform frame; wait for the portrait surface so the wrapper
+            # is not built around the wrong geometry.
             $ready = $true
-            # Settings first paints only the list pane; the detail pane is a
-            # second WSLg window that appears a moment later. Wait for it so
-            # the wrapper is built with the full two-pane desktop.
-            if ($st.App.Package -eq 'com.android.settings' -and $st.SeekTicks -lt 10) {
-                $probe = Get-AppPanes $st.App $h
-                $ready = (@($probe.Panes).Count -ge 2)
+            if ($st.App.Package -eq 'com.android.settings' -and $st.SeekTicks -lt 30) {
+                $cr = New-Object NativeWin+RECT
+                [void][NativeWin]::GetClientRect($h, [ref]$cr)
+                if ($cr.Right -le 0 -or $cr.Bottom -le 0) { $ready = $false }
+                elseif (($cr.Right / $cr.Bottom) -gt 0.8) { $ready = $false }
+                # Without the Android frame the tap mapping would use 0,0
+                # and every click would land near the top-left of Android.
+                $frames = @(Get-AndroidWindowFrames $st.App.Package)
+                if ($frames.Count -eq 0) { $ready = $false }
             }
             $st.SeekTicks++
             if ($ready) {
@@ -2237,13 +2797,27 @@ function Start-AppLaunch($app) {
         Hwnd = [IntPtr]::Zero
         Wrapped = $false
         Size = Get-SelectedSize
-        WindowMatch = $(if ($app.Package -eq 'com.android.settings') { 'Settings' } else { $app.Name })
+        # The WSLg title is the localized Android window title, e.g.
+        # "Настройки (Ubuntu-24.04)" or "Infinite Magicraid (Ubuntu-24.04)".
+        # Matching the English "Settings" made the launch wait forever on a
+        # Russian system while the raw Android window stayed on the desktop.
+        WindowMatch = $app.Name
+    }
+
+    # Apply the window size picked in the manager (phone / tablet) to the
+    # Android display before the app starts, so the launched surface really
+    # uses that geometry instead of falling back to the phone-sized default.
+    if ($null -ne $script:launchState.Size) {
+        $sz = $script:launchState.Size
+        try { Send-Android "wm size $($sz.Width)x$($sz.Height)" } catch { }
+        Start-Sleep -Milliseconds 600
     }
 
     $displayName = Get-AppDisplayName $app
     $loaderTitle.Text = "Запуск: $displayName"
     $loaderSub.Text = 'Открываю приложение в отдельном окне.'
     $loaderElapsed.Text = '0 сек'
+    if ($null -ne $loaderIcon) { try { $loaderIcon.Source = Get-AppIconPath $app } catch { } }
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
     $launchTimer.Start()
@@ -2436,11 +3010,19 @@ function Convert-PngToIco([string]$pngPath, [string]$icoPath) {
 function Get-AppIconPath($app) {
     $generic = Join-Path $script:baseDir 'assets\android.ico'
     $dex = Join-Path $script:baseDir 'assets\winoid-icon.dex'
-    if (-not (Test-Path -LiteralPath $dex)) { return $generic }
+    if (-not (Test-Path -LiteralPath $dex)) { return [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($generic)) }
 
     $iconsDir = Join-Path $script:dataRoot 'icons'
     if (-not (Test-Path -LiteralPath $iconsDir)) { New-Item -ItemType Directory -Path $iconsDir -Force | Out-Null }
     $ico = Join-Path $iconsDir ($app.Package + '.ico')
+    if (Test-Path -LiteralPath $ico) {
+        # Cached per-package icon: skip the ADB round-trips on repeat refreshes.
+        return [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($ico))
+    }
+    # A frozen Waydroid container makes every adb call hang until its timeout.
+    # Probe once per refresh: after the first failure use the bundled icon for
+    # the rest of the list instead of freezing the UI for minutes.
+    if ($script:iconAdbOffline) { return [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($generic)) }
     $remoteDex = '/data/local/tmp/winoid-icon.dex'
     $remotePng = '/data/local/tmp/winoid-icon-' + $app.Package + '.png'
     $localPng = Join-Path $env:TEMP ('winoid-icon-' + [Guid]::NewGuid().ToString('N') + '.png')
@@ -2450,17 +3032,17 @@ function Get-AppIconPath($app) {
     # the route to the Waydroid subnet.
     if ($script:adbPath) {
         try {
-            $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 8000
+            $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 6000
             if ($state -notmatch '^device') {
-                $null = Invoke-AdbCli -Arguments @('connect', $script:adbSerial) -TimeoutMs 12000
-                $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 8000
+                $null = Invoke-AdbCli -Arguments @('connect', $script:adbSerial) -TimeoutMs 8000
+                $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 6000
             }
             if ($state -match '^device') {
-                $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 20000
+                $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 10000
                 $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
-                $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 25000
+                $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 10000
                 if ($res -match 'OK') {
-                    $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'pull', $remotePng, $localPng) -TimeoutMs 20000
+                    $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'pull', $remotePng, $localPng) -TimeoutMs 10000
                     if (Test-Path -LiteralPath $localPng) { $ok = $true }
                 }
             }
@@ -2470,19 +3052,19 @@ function Get-AppIconPath($app) {
     if (-not $ok) {
         try {
             $stateArgs = (Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'get-state')
-            $r = Invoke-Wsl $stateArgs 15000
+            $r = Invoke-Wsl $stateArgs 6000
             if ($r.Out -notmatch 'device') {
-                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', 'connect', $script:adbSerial)) 15000
-                $r = Invoke-Wsl $stateArgs 15000
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', 'connect', $script:adbSerial)) 8000
+                $r = Invoke-Wsl $stateArgs 6000
             }
             if ($r.Code -eq 0 -and $r.Out -match 'device') {
                 $linuxDex = ConvertTo-WslPath $dex
                 $linuxPng = ConvertTo-WslPath $localPng
-                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) 20000
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) 10000
                 $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
-                $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 25000
+                $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 10000
                 if ($res.Out -match 'OK') {
-                    $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'pull', $remotePng, $linuxPng)) 20000
+                    $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'pull', $remotePng, $linuxPng)) 10000
                     if (Test-Path -LiteralPath $localPng) { $ok = $true }
                 }
             }
@@ -2493,11 +3075,12 @@ function Get-AppIconPath($app) {
         try {
             Convert-PngToIco $localPng $ico
             Remove-Item -LiteralPath $localPng -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $ico) { return $ico }
+            if (Test-Path -LiteralPath $ico) { return [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($ico)) }
         } catch { }
     }
     Remove-Item -LiteralPath $localPng -Force -ErrorAction SilentlyContinue
-    return $generic
+    if (-not $ok) { $script:iconAdbOffline = $true }
+    return [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($generic))
 }
 
 function Update-AppShortcutIconAsync($app, [string]$lnkPath) {
@@ -2981,4 +3564,5 @@ $loader.Add_Closing({
 $script:frameTimer.Start()
 $requestTimer.Start()
 $window.Show()
+Set-WinoidDarkTitleBar $window
 [System.Windows.Threading.Dispatcher]::Run()
