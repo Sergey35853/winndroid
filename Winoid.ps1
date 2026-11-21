@@ -447,8 +447,10 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.17'
+$script:appVersion = '0.1.18'
 $script:iconQueue = New-Object System.Collections.Queue
+$script:hideCaption = $true
+$script:captionHeightPx = 48
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
@@ -460,6 +462,8 @@ if (Test-Path -LiteralPath $script:configPath) {
         if ($cfg.adbSerial) { $script:adbSerial = [string]$cfg.adbSerial }
         if ($cfg.adbTimeoutMs) { $script:adbTimeoutMs = [int]$cfg.adbTimeoutMs }
         if ($cfg.sessionTimeoutMs) { $script:sessionTimeoutMs = [int]$cfg.sessionTimeoutMs }
+        if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'hideCaption')) { $script:hideCaption = [bool]$cfg.hideCaption }
+        if ($cfg.captionHeightPx) { $script:captionHeightPx = [int]$cfg.captionHeightPx }
         if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
@@ -490,6 +494,16 @@ function Save-ArmCompatSetting {
             } else {
                 $cfg | Add-Member -NotePropertyName armTranslator -NotePropertyValue ([string]$script:armTranslator)
             }
+        }
+        if ($cfg.PSObject.Properties.Name -contains 'hideCaption') {
+            $cfg.hideCaption = [bool]$script:hideCaption
+        } else {
+            $cfg | Add-Member -NotePropertyName hideCaption -NotePropertyValue ([bool]$script:hideCaption)
+        }
+        if ($cfg.PSObject.Properties.Name -contains 'captionHeightPx') {
+            $cfg.captionHeightPx = [int]$script:captionHeightPx
+        } else {
+            $cfg | Add-Member -NotePropertyName captionHeightPx -NotePropertyValue ([int]$script:captionHeightPx)
         }
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
     } catch {
@@ -804,6 +818,7 @@ $mainXaml = @'
         </ComboBox>
         <CheckBox x:Name="RememberModeCheck" Content="Запоминать режим для каждого приложения" Foreground="#C9CDD4" Margin="2,0,0,12"/>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
+        <CheckBox x:Name="HideCaptionCheck" Content="Скрывать заголовок Android (стрелка и кнопки окна)" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,4"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
         <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
@@ -995,6 +1010,8 @@ $rememberModeCheck = $window.FindName('RememberModeCheck')
 $rememberModeCheck.IsChecked = [bool]$script:rememberMode
 $autoHideCheck = $window.FindName('AutoHideCheck')
 $armCompatCheck = $window.FindName('ArmCompatCheck')
+$hideCaptionCheck = $window.FindName('HideCaptionCheck')
+$hideCaptionCheck.IsChecked = [bool]$script:hideCaption
 $armCompatCheck.IsChecked = [bool]$script:armCompat
 $armCompatHint = $window.FindName('ArmCompatHint')
 $footerText    = $window.FindName('FooterText')
@@ -1958,6 +1975,8 @@ function Map-WrapperPoint($w, $pos) {
             $ty = [int]$at.Value
             $tx = $tx + $sx - $x0
             $ty = $ty + $sy - $y0
+            $cp = $pane.PSObject.Properties['CaptionInset']
+            if ($null -ne $cp) { $ty += [int]$cp.Value }
             return @($tx, $ty)
         }
         return @($sx, $sy)
@@ -2100,6 +2119,11 @@ function Set-PaneAndroidFrames($panes, $frames) {
 
         $pane | Add-Member -NotePropertyName AndroidL -NotePropertyValue $ax -Force
         $pane | Add-Member -NotePropertyName AndroidT -NotePropertyValue $ay -Force
+        # A pane as tall as the Android frame contains the freeform title bar
+        # (back arrow + window buttons). An immersive pane is shorter by that
+        # bar, so there is nothing to hide there.
+        $titleBar = if ($dh -ge -16) { [int]$script:captionHeightPx } else { 0 }
+        $pane | Add-Member -NotePropertyName TitleBar -NotePropertyValue $titleBar -Force
     }
 }
 
@@ -2459,7 +2483,6 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             if ($null -ne $al -and $null -ne $at) { "$([int]$_.W)x$([int]$_.H)@$($al.Value),$($at.Value)" }
             else { "$([int]$_.W)x$([int]$_.H)@?" }
         }) -join ' '
-        Write-WinoidLog ("wrapper $($app.Package): frames=$($androidFrames.Count) panes=$paneInfo")
     } catch { }
 
     # WSLg splits an Android window into a top-level frame and one or more
@@ -2519,7 +2542,17 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         $visH = [int]($pane.H - $spec.NavInset)
         if ($visH -gt ($srcH - $vy)) { $visH = $srcH - $vy }
         if ($visH -lt 1) { $visH = [int]$pane.H }
+        # Hide the Android freeform title bar (back arrow + window buttons)
+        # by cropping it from the captured frame. Immersive panes have no bar.
+        $tb = 0
+        if ($script:hideCaption) {
+            $tbProp = $pane.PSObject.Properties['TitleBar']
+            if ($null -ne $tbProp) { $tb = [int]$tbProp.Value } else { $tb = [int]$script:captionHeightPx }
+            $tb = [Math]::Min($tb, [Math]::Max(0, $visH - 40))
+        }
+        $visH = [Math]::Max(1, $visH - $tb)
         [void]$pane.PSObject.Properties.Remove('Grab')
+        $pane | Add-Member -NotePropertyName CaptionInset -NotePropertyValue $tb -Force
         $pane | Add-Member -NotePropertyName VX -NotePropertyValue $vx -Force
         $pane | Add-Member -NotePropertyName VY -NotePropertyValue $vy -Force
         $pane | Add-Member -NotePropertyName VisH -NotePropertyValue $visH -Force
@@ -2546,12 +2579,21 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         }
     }
 
+    $capMax = 0
+    foreach ($pane in $panes) {
+        $cp = $pane.PSObject.Properties['CaptionInset']
+        if ($null -ne $cp -and [int]$cp.Value -gt $capMax) { $capMax = [int]$cp.Value }
+    }
+    if ($capMax -gt 0) { $srcH = [Math]::Max(1, $srcH - $capMax) }
+    try { Write-WinoidLog ("wrapper $($app.Package): frames=$($androidFrames.Count) panes=$paneInfo caption=$capMax") } catch { }
+
     $w = @{}
     $w.Package = $app.Package
     $w.AppName = $displayName
     $w.Source = $source
     $w.SrcW = $srcW
     $w.SrcH = $srcH
+    $w.CaptionInset = $capMax
     $w.NavInset = $spec.NavInset
     $w.Panes = @($panes)
     # Keep the ArrayList so Sync-SettingsSurface can park newly opened
@@ -2905,8 +2947,11 @@ $script:frameTimer.Add_Tick({
                 $vw = [Math]::Min([int]$pane.W - $cx, [int]$w.SrcW - [int]$pane.VX)
                 $vh = [Math]::Min([int]$pane.VisH - $cy, [int]$w.SrcH - [int]$pane.VY)
                 if ($vw -lt 1 -or $vh -lt 1) { continue }
+                $capProp = $pane.PSObject.Properties['CaptionInset']
+                $capPx = 0
+                if ($null -ne $capProp) { $capPx = [int]$capProp.Value }
                 [void]$pane.Grab.Capture($pane.Source)
-                $srcRect = [System.Windows.Int32Rect]::new($cx, $cy, $vw, $vh)
+                $srcRect = [System.Windows.Int32Rect]::new($cx, $cy + $capPx, $vw, $vh)
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
                 $lumaSum += $pane.Grab.MeanLuma() * $vh
                 $lumaRows += $vh
@@ -3908,6 +3953,14 @@ $backendBtn.Add_Click({
 })
 $fullUiBtn.Add_Click({ Invoke-Safe 'restart' { Start-Session -Restart } })
 $settingsBtn.Add_Click({ Invoke-Safe 'settingsBtn' { Start-AndroidWindow 'com.android.settings' 'Настройки Android' } })
+$hideCaptionCheck.Add_Checked({ Invoke-Safe 'captionOn' {
+    $script:hideCaption = $true; Save-ArmCompatSetting
+    Set-Footer 'Заголовок Android будет скрыт в новых окнах.'
+} })
+$hideCaptionCheck.Add_Unchecked({ Invoke-Safe 'captionOff' {
+    $script:hideCaption = $false; Save-ArmCompatSetting
+    Set-Footer 'Заголовок Android будет показан в новых окнах.'
+} })
 $armCompatCheck.Add_Checked({
     Invoke-Safe 'armCompatOn' {
         $script:armCompat = [bool]$armCompatCheck.IsChecked

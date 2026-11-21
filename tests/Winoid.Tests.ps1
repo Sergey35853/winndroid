@@ -25,7 +25,8 @@ foreach ($needle in @(
     'Source="{Binding Icon}"',
     'function Ensure-WaydroidAwake', 'function Get-CachedLauncherApps',
     'function Set-LiveDisplayMode', 'function Get-AppIconPath', 'function Show-Diagnostics',
-    'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop'
+    'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop',
+    'x:Name="HideCaptionCheck"', 'CaptionInset', 'function Restore-OrphanedParkedWindows'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }
