@@ -447,7 +447,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.16'
+$script:appVersion = '0.1.17'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
@@ -1715,6 +1715,46 @@ function Refresh-Apps {
     if ($script:iconQueue.Count -gt 0) { $iconTimer.Start() }
 }
 
+# A watchdog restart leaves WSLg windows parked off-screen by the previous
+# manager. Bring them back so a relaunch can find them again.
+function Restore-OrphanedParkedWindows {
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $threshold = $vs.Right + 100
+    foreach ($proc in @(Get-Process msrdc -ErrorAction SilentlyContinue)) {
+        $wins = @()
+        try { $wins = @([NativeWin]::ListWindows([uint32]$proc.Id)) } catch { continue }
+        foreach ($wnd in $wins) {
+            if ($null -eq $wnd -or -not $wnd.Visible) { continue }
+            $r = New-Object NativeWin+RECT
+            [void][NativeWin]::GetWindowRect($wnd.Hwnd, [ref]$r)
+            if ([int]$r.Left -lt $threshold) { continue }
+            $ex = [NativeWin]::GetWindowLong($wnd.Hwnd, -20)
+            $ex = ($ex -bor 0x00040000) -band (-bnot 0x00000080)
+            [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, $ex)
+            [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, 0, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
+            Write-WinoidLog "restored orphan window: $($wnd.Title)"
+        }
+    }
+}
+
+# Status can say RUNNING while the activity manager no longer creates WSLg
+# windows ("Sending reply failed"). Restarting the user session is the only
+# reliable recovery; the manager then rebuilds wrappers from scratch.
+function Restart-WaydroidSession {
+    Write-WinoidLog 'restarting waydroid-session.service'
+    try {
+        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'systemctl --user restart waydroid-session.service')) 30000
+    } catch { }
+    for ($i = 0; $i -lt 50; $i++) {
+        Start-Sleep -Milliseconds 1000
+        if ((Get-WaydroidContainerStatus) -eq 'RUNNING') { break }
+    }
+    if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
+    try { Initialize-Adb } catch { }
+    Start-Sleep -Seconds 6
+    Write-WinoidLog 'waydroid session restarted'
+}
+
 # Switch phone/tablet geometry of a running wrapper without reopening it.
 function Set-LiveDisplayMode($w, [string]$mode) {
     if ($null -eq $w -or $w.Closed) { return }
@@ -2976,10 +3016,24 @@ $launchTimer.Add_Tick({
         }
     }
 
-    if ($sec -ge 900) {
+    # No window after 30 s: the activity is usually still alive but its WSLg
+    # surface is gone (msrdc restart / manager watchdog restart). Resuming it
+    # never creates a window, so force-stop once and launch again.
+    if ($sec -eq 35 -and -not $st.Wrapped -and -not $st.Retried) {
+        $st.Retried = $true
+        Write-WinoidLog "launch retry: $($st.App.Package) (no window after 35s)"
+        $loaderSub.Text = 'Окно не появилось — перезапускаю Android и приложение…'
+        foreach ($wr in @($script:wrappers)) {
+            Invoke-Safe 'retry.wrapper' { Remove-Wrapper $wr $true }
+        }
+        Restart-WaydroidSession
+        try { $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', [string]$st.LaunchCmd)) 15000 } catch { }
+    }
+
+    if ($sec -ge 180) {
         $loader.Hide()
         $launchTimer.Stop()
-        Set-Footer 'Окно не появилось за 15 минут. Проверьте состояние Android.'
+        Set-Footer 'Окно не появилось за 3 минуты. Проверьте состояние Android.'
     }
     }
 })
@@ -3038,6 +3092,8 @@ function Start-AppLaunch($app) {
         SeekTicks = 0
         Hwnd = [IntPtr]::Zero
         Wrapped = $false
+        Retried = $false
+        LaunchCmd = ''
         Size = Get-SelectedSize
         # The WSLg title is the localized Android window title, e.g.
         # "Настройки (Ubuntu-24.04)" or "Infinite Magicraid (Ubuntu-24.04)".
@@ -3071,6 +3127,15 @@ function Start-AppLaunch($app) {
         Start-Sleep -Milliseconds 600
     }
 
+    # A previous launch can leave the Android activity alive with no WSLg
+    # surface at all (window died with msrdc or the manager was restarted).
+    # Resuming such an activity never creates a window, so stop it first:
+    # the launch below then creates a fresh Android/WSLg window.
+    try {
+        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'am', 'force-stop', $app.Package)) 8000
+    } catch { }
+    Start-Sleep -Milliseconds 350
+
     $displayName = Get-AppDisplayName $app
     $loaderTitle.Text = "Запуск: $displayName"
     $loaderSub.Text = 'Открываю приложение в отдельном окне.'
@@ -3082,8 +3147,11 @@ function Start-AppLaunch($app) {
     Set-Footer ("Запуск $displayName…" + $compatNote)
 
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $($app.Package)"
+    $script:launchState.LaunchCmd = $cmd
     try {
-        Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', $cmd))
+        # waydroid app launch returns as soon as the request is accepted;
+        # a bounded call is more reliable than a detached wsl.exe process.
+        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 15000
     } catch {
         Write-WinoidLog ("ERROR launch " + $app.Package + ": " + $_.Exception.ToString())
         $launchTimer.Stop()
@@ -3941,6 +4009,7 @@ $window.Add_Closed({
 })
 $window.Add_Loaded({
     Invoke-Safe 'loaded.keepalive' { Start-WslKeepAlive }
+    Invoke-Safe 'loaded.restore' { Restore-OrphanedParkedWindows }
     Invoke-Safe 'loaded.session' { if (-not (Test-Session)) { Start-Session } }
     # When Android is still booting, Refresh-Apps and Initialize-Adb would
     # block the UI thread for tens of seconds before the session timer gets a

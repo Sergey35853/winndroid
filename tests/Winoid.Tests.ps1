@@ -24,7 +24,8 @@ foreach ($needle in @(
     'x:Name="PhoneModeBtn"', 'x:Name="TabletModeBtn"', 'x:Name="RememberModeCheck"',
     'Source="{Binding Icon}"',
     'function Ensure-WaydroidAwake', 'function Get-CachedLauncherApps',
-    'function Set-LiveDisplayMode', 'function Get-AppIconPath', 'function Show-Diagnostics'
+    'function Set-LiveDisplayMode', 'function Get-AppIconPath', 'function Show-Diagnostics',
+    'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }
