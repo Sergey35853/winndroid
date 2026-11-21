@@ -447,6 +447,10 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
+$script:appVersion = '0.1.16'
+$script:iconQueue = New-Object System.Collections.Queue
+$script:adbTimeoutMs = 10000
+$script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
 $script:configPath = Join-Path $script:configDir 'config.json'
 if (Test-Path -LiteralPath $script:configPath) {
@@ -454,6 +458,8 @@ if (Test-Path -LiteralPath $script:configPath) {
         $cfg = Get-Content -LiteralPath $script:configPath -Raw | ConvertFrom-Json
         if ($cfg.wslDistro) { $script:wslDistro = [string]$cfg.wslDistro }
         if ($cfg.adbSerial) { $script:adbSerial = [string]$cfg.adbSerial }
+        if ($cfg.adbTimeoutMs) { $script:adbTimeoutMs = [int]$cfg.adbTimeoutMs }
+        if ($cfg.sessionTimeoutMs) { $script:sessionTimeoutMs = [int]$cfg.sessionTimeoutMs }
         if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
@@ -489,6 +495,36 @@ function Save-ArmCompatSetting {
     } catch {
         Write-WinoidLog ("ERROR save config: " + $_.Exception.ToString())
     }
+}
+
+function Read-JsonFile([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json) } catch { return $null }
+}
+
+# Per-application display mode (phone / tablet) remembered between launches.
+$script:modesPath = Join-Path $script:dataRoot 'modes.json'
+$script:appModes = @{}
+$script:rememberMode = $false
+if (Test-Path -LiteralPath $script:modesPath) {
+    try {
+        $mc = Get-Content -LiteralPath $script:modesPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $script:rememberMode = [bool]$mc.remember
+        if ($null -ne $mc.modes) {
+            foreach ($prop in $mc.modes.PSObject.Properties) { $script:appModes[[string]$prop.Name] = [int]$prop.Value }
+        }
+    } catch { }
+}
+
+function Save-AppModes {
+    try {
+        $map = [pscustomobject]@{}
+        foreach ($key in @($script:appModes.Keys)) {
+            $map | Add-Member -NotePropertyName ([string]$key) -NotePropertyValue ([int]$script:appModes[$key]) -Force
+        }
+        ([pscustomobject]@{ remember = [bool]$script:rememberMode; modes = $map }) |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:modesPath -Encoding utf8NoBOM
+    } catch { Write-WinoidLog ("ERROR save modes: " + $_.Exception.ToString()) }
 }
 
 $mainXaml = @'
@@ -716,7 +752,7 @@ $mainXaml = @'
             </Border>
             <Button x:Name="RefreshBtn" Grid.Column="1" Content="Обновить" Margin="8,0,0,0" Padding="12,7"/>
           </Grid>
-          <ListBox x:Name="AppsList" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+          <ListBox x:Name="AppsList" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" SelectionMode="Extended">
             <ListBox.ItemTemplate>
               <DataTemplate>
                 <Grid>
@@ -747,6 +783,11 @@ $mainXaml = @'
         <Button x:Name="DriveBtn" Content="Открыть диск Android"/>
         <Button x:Name="MyComputerBtn" Content="Мой компьютер" ToolTip="Открыть проводник Windows: Этот компьютер (shell:MyComputerFolder)"/>
         <Button x:Name="UninstallBtn" Content="Удалить приложение (APK)" IsEnabled="False" ToolTip="Удалить выбранное приложение из Android"/>
+        <Button x:Name="DeleteApkBtn" Content="Удалить APK-файл…" ToolTip="Удалить скачанный APK-файл с диска"/>
+        <Button x:Name="DiagBtn" Content="Диагностика и лог"/>
+        <Button x:Name="UpdateBtn" Content="Проверить обновления"/>
+        <Button x:Name="ExportCfgBtn" Content="Экспорт настроек"/>
+        <Button x:Name="ImportCfgBtn" Content="Импорт настроек"/>
         <Button x:Name="FullUiBtn" Content="Перезапустить Android"/>
         <Button x:Name="SettingsBtn" Content="Настройки Android"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
@@ -761,6 +802,7 @@ $mainXaml = @'
           <ComboBoxItem Content="1600 × 900"/>
           <ComboBoxItem Content="1920 × 1080"/>
         </ComboBox>
+        <CheckBox x:Name="RememberModeCheck" Content="Запоминать режим для каждого приложения" Foreground="#C9CDD4" Margin="2,0,0,12"/>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
         <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
@@ -814,6 +856,33 @@ $loaderXaml = @'
 </Window>
 '@
 
+$diagXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Winoid — диагностика" Width="720" Height="540"
+        WindowStartupLocation="CenterScreen" Background="#141519" Foreground="#F1F3F5">
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#26282F"/>
+      <Setter Property="Foreground" Value="#F1F3F5"/>
+      <Setter Property="Padding" Value="12,7"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+    </Style>
+  </Window.Resources>
+  <DockPanel Margin="16">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="DiagRefreshBtn" Content="Обновить" Width="110"/>
+      <Button x:Name="DiagOpenLogBtn" Content="Открыть лог" Width="120"/>
+      <Button x:Name="DiagCloseBtn" Content="Закрыть" Width="100" Margin="0"/>
+    </StackPanel>
+    <TextBox x:Name="DiagText" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap"
+             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+             Background="#0B0C0E" Foreground="#D6DAE2" BorderBrush="#2A2C33"
+             FontFamily="Consolas" FontSize="11"/>
+  </DockPanel>
+</Window>
+'@
+
 $script:wrapperNavHeight = 44
 
 $script:wrapperXaml = @'
@@ -862,6 +931,8 @@ $script:wrapperXaml = @'
           <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="PhoneModeBtn" Content="Телефон" FontSize="11" Padding="8,5" ToolTip="Вертикальный режим 720 × 1280"/>
+          <Button x:Name="TabletModeBtn" Content="Планшет" FontSize="11" Padding="8,5" ToolTip="Горизонтальный режим 1280 × 800"/>
           <Button x:Name="BackBtn" Content="◀  Назад" ToolTip="Назад в Android (Esc, Backspace или Alt+←)"/>
           <Button x:Name="HomeBtn" Content="●  Домой" ToolTip="На главный экран Android (Home)"/>
           <Button x:Name="RecentsBtn" Content="■  Недавние" ToolTip="Недавние приложения Android"/>
@@ -892,6 +963,8 @@ $script:wrapperXaml = @'
 
 $window = [System.Windows.Markup.XamlReader]::Parse($mainXaml)
 $loader = [System.Windows.Markup.XamlReader]::Parse($loaderXaml)
+$diagWindow = [System.Windows.Markup.XamlReader]::Parse($diagXaml)
+try { $diagWindow.Owner = $window } catch { }
 
 $script:appIcon = $null
 $iconPath = Join-Path $PSScriptRoot 'assets\android.ico'
@@ -918,11 +991,23 @@ $settingsBtn   = $window.FindName('SettingsBtn')
 $installBtn    = $window.FindName('InstallBtn')
 $backendBtn    = $window.FindName('BackendBtn')
 $sizeBox       = $window.FindName('SizeBox')
+$rememberModeCheck = $window.FindName('RememberModeCheck')
+$rememberModeCheck.IsChecked = [bool]$script:rememberMode
 $autoHideCheck = $window.FindName('AutoHideCheck')
 $armCompatCheck = $window.FindName('ArmCompatCheck')
 $armCompatCheck.IsChecked = [bool]$script:armCompat
 $armCompatHint = $window.FindName('ArmCompatHint')
 $footerText    = $window.FindName('FooterText')
+
+$diagBtn       = $window.FindName('DiagBtn')
+$deleteApkBtn  = $window.FindName('DeleteApkBtn')
+$updateBtn     = $window.FindName('UpdateBtn')
+$exportCfgBtn  = $window.FindName('ExportCfgBtn')
+$importCfgBtn  = $window.FindName('ImportCfgBtn')
+$diagText      = $diagWindow.FindName('DiagText')
+$diagRefreshBtn = $diagWindow.FindName('DiagRefreshBtn')
+$diagOpenLogBtn = $diagWindow.FindName('DiagOpenLogBtn')
+$diagCloseBtn  = $diagWindow.FindName('DiagCloseBtn')
 
 $loaderTitle   = $loader.FindName('LoaderTitle')
 $loaderSub     = $loader.FindName('LoaderSub')
@@ -939,6 +1024,29 @@ function Set-Status([string]$text, [string]$color) {
 
 function Set-Footer([string]$text) {
     $footerText.Text = $text
+}
+
+function Show-Diagnostics {
+    try {
+        $lines = New-Object System.Collections.ArrayList
+        [void]$lines.Add('=== Winoid ===')
+        [void]$lines.Add("Version: $($script:appVersion)   Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+        [void]$lines.Add("WSL distro: $($script:wslDistro)   ADB: $($script:adbSerial)")
+        $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'waydroid', 'status')) 10000
+        [void]$lines.Add('=== Waydroid ===')
+        [void]$lines.Add($(if ($r.Out) { $r.Out.Trim() } else { "unavailable: $($r.Err)" }))
+        [void]$lines.Add('=== State ===')
+        [void]$lines.Add("Apps: $($script:apps.Count)   Wrappers: $($script:wrappers.Count)   ADB shell: $(if ($script:adb -and $script:adb.Running) {'up'} else {'down'})")
+        [void]$lines.Add("Icons: $(@(Get-ChildItem -LiteralPath (Join-Path $script:dataRoot 'icons') -ErrorAction SilentlyContinue).Count)")
+        [void]$lines.Add('=== Log (last 40) ===')
+        $log = Join-Path $script:dataRoot 'winoid.log'
+        if (Test-Path -LiteralPath $log) { [void]$lines.AddRange(@(Get-Content -LiteralPath $log -Tail 40)) }
+        $diagText.Text = ($lines -join "`r`n")
+        if (-not $diagWindow.IsVisible) { $diagWindow.Show() }
+        $diagWindow.Activate()
+    } catch {
+        Set-Footer "Диагностика недоступна: $($_.Exception.Message)"
+    }
 }
 
 # --- diagnostics -----------------------------------------------------------
@@ -996,6 +1104,13 @@ $window.Dispatcher.Add_UnhandledException({
     param($sender, $e)
     try { Write-WinoidLog ("FATAL: " + $e.ExceptionObject.ToString()) } catch { }
 })
+
+# Watchdog support: the launcher stub restarts the manager if it disappears
+# without a clean shutdown request. The heartbeat proves we were alive.
+$script:heartbeatPath = Join-Path $script:dataRoot 'heartbeat'
+$script:shutdownPath = Join-Path $script:dataRoot 'shutdown.request'
+$script:lastHeartbeat = [DateTime]::MinValue
+try { Remove-Item -LiteralPath $script:shutdownPath -Force -ErrorAction SilentlyContinue } catch { }
 
 function Get-WslBase {
     param([switch]$Root)
@@ -1360,6 +1475,35 @@ function Get-WaydroidStatus {
     return 'STOPPED'
 }
 
+# Session: RUNNING is not enough: Waydroid suspends the container when idle
+# (Container: FROZEN) and then adb, the DEX helper and app launches all hang.
+function Get-WaydroidContainerStatus {
+    $r = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'waydroid', 'status')) 15000
+    if ($r.Out -match '(?m)^Container:\s*(\S+)') { return $matches[1] }
+    return 'UNKNOWN'
+}
+
+# Wake a suspended Android runtime before any operation that needs adb.
+# show-full-ui opens the launcher surface, which the manager already parks.
+function Ensure-WaydroidAwake {
+    $state = Get-WaydroidContainerStatus
+    if ($state -eq 'RUNNING') { return $true }
+    if ($state -eq 'FROZEN') {
+        Write-WinoidLog 'waydroid frozen: waking container'
+        try {
+            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'nohup waydroid show-full-ui >/dev/null 2>&1 &')) 10000
+        } catch { }
+        for ($i = 0; $i -lt 14; $i++) {
+            Start-Sleep -Milliseconds 700
+            if ((Get-WaydroidContainerStatus) -eq 'RUNNING') {
+                Write-WinoidLog 'waydroid awake'
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
 # Which ARM translator Waydroid uses. Setup-Backend stores it in config.json;
 # on older installs it is read from waydroid.cfg once per manager run.
 function Get-ArmTranslator {
@@ -1455,25 +1599,35 @@ function Get-LauncherApps {
             $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 20000
             if ($res.Out) { $out = $res.Out }
         }
-    } catch { }
+    } catch { Write-WinoidLog ("ERROR app list via WSL: " + $_.Exception.Message) }
 
     if (-not $out -and $script:adbPath) {
         try {
             $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 15000
             $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 20000
             if ($res) { $out = $res }
-        } catch { }
+        } catch { Write-WinoidLog ("ERROR app list via adb: " + $_.Exception.Message) }
     }
 
     $byPackage = @{}
+    $iconsDir = Join-Path $script:dataRoot 'icons'
+    $fallbackIcon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new((Join-Path $script:baseDir 'assets\android.ico')))
     foreach ($line in ($out -split "`r?`n")) {
         if ($line -match '^([^\t]+)\t(\S+)$') {
             $name = $matches[1].Trim()
             $pkg = $matches[2].Trim()
             if (-not $byPackage.ContainsKey($pkg)) {
                 $appItem = [pscustomobject]@{ Name = $name; Package = $pkg }
-                # Real extracted icon (BitmapFrame) instead of the "A" placeholder.
-                $appItem | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $appItem) -Force
+                $cachedIco = Join-Path $iconsDir ($pkg + '.ico')
+                if (Test-Path -LiteralPath $cachedIco) {
+                    $icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($cachedIco))
+                } else {
+                    # Do the slow adb extraction one app at a time on a timer
+                    # so the manager window never freezes during a refresh.
+                    $icon = $fallbackIcon
+                    $script:iconQueue.Enqueue($pkg)
+                }
+                $appItem | Add-Member -MemberType NoteProperty -Name Icon -Value $icon -Force
                 $byPackage[$pkg] = $appItem
             }
         }
@@ -1509,6 +1663,7 @@ function Get-CachedLauncherApps {
 
 function Refresh-Apps {
     $script:iconAdbOffline = $false
+    $script:iconQueue.Clear()
     if (-not (Test-Backend)) {
         $script:apps = @()
         Update-AppFilter
@@ -1517,6 +1672,8 @@ function Refresh-Apps {
         return
     }
     Set-Footer 'Чтение списка приложений…'
+    # A suspended container cannot answer the DEX helper or adb.
+    Ensure-WaydroidAwake | Out-Null
 
     $script:apps = @(Get-LauncherApps)
     if ($script:apps.Count -eq 0) {
@@ -1555,6 +1712,30 @@ function Refresh-Apps {
     }
     Update-AppFilter
     Set-Footer "Приложений: $($script:apps.Count)"
+    if ($script:iconQueue.Count -gt 0) { $iconTimer.Start() }
+}
+
+# Switch phone/tablet geometry of a running wrapper without reopening it.
+function Set-LiveDisplayMode($w, [string]$mode) {
+    if ($null -eq $w -or $w.Closed) { return }
+    if (-not (Ensure-WaydroidAwake)) {
+        Set-Footer 'Android не отвечает — не могу сменить режим.'
+        return
+    }
+    try {
+        if ($mode -eq 'phone') {
+            Send-Android 'wm size 720x1280'
+            Send-Android 'wm density 320'
+            Set-Footer 'Режим: телефон (вертикально 720 × 1280).'
+        } else {
+            Send-Android 'wm size 1280x800'
+            Send-Android 'wm density 160'
+            Set-Footer 'Режим: планшет (горизонтально 1280 × 800).'
+        }
+    } catch {
+        Write-WinoidLog ("ERROR display mode: " + $_.Exception.ToString())
+        Set-Footer "Не удалось сменить режим: $($_.Exception.Message)"
+    }
 }
 
 function Get-SelectedSize {
@@ -1950,6 +2131,21 @@ function Sync-SettingsSurface($w) {
     $topAct = ''
     try { $topAct = [string]$w.SettingsTop } catch { }
     $rootTop = ($topAct -match 'com\.android\.settings/\.Settings$')
+    # Ask Android for the real top activity when our cached value is empty.
+    # Throttled: dumpsys is too heavy for every 350 ms frame.
+    if ([string]::IsNullOrWhiteSpace($topAct)) {
+        $probeAt = $null
+        try { $probeAt = [DateTime]$w.SettingsTopProbeAt } catch { }
+        if ($null -eq $probeAt -or ([DateTime]::UtcNow - $probeAt).TotalMilliseconds -ge 1500) {
+            try { $w.SettingsTopProbeAt = [DateTime]::UtcNow } catch { }
+            $live = Get-AndroidTopActivity
+            if (-not [string]::IsNullOrWhiteSpace($live)) {
+                $topAct = $live
+                try { $w.SettingsTop = $live } catch { }
+                $rootTop = ($live -match 'com\.android\.settings/\.Settings$')
+            }
+        }
+    }
 
     $active = $candidates[0]
     if ($rootTop) {
@@ -2329,6 +2525,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     # sub-surface from an earlier session is still above it.
     $w.SettingsTop = 'com.android.settings/.Settings'
     $w.SettingsTopDue = $null
+    $w.SettingsTopProbeAt = $null
     $w.FrameL = 0; $w.FrameT = 0; $w.FrameW = $srcW; $w.FrameH = $srcH
     if ($null -ne $settingsFrame) {
         $w.FrameL = [int]$settingsFrame.L
@@ -2345,6 +2542,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.DownX = 0; $w.DownY = 0; $w.Dragging = $false; $w.DragSent = $false
     $w.LastMoveT = [DateTime]::MinValue
     $w.LoadingIcon = $null
+    $w.WheelAcc = 0
     # The onboarding hint covers game UI until the first tap; hide it by
     # itself after a few seconds so screenshots and idle windows stay clean.
     $w.HintUntil = [DateTime]::UtcNow.AddSeconds(8)
@@ -2361,6 +2559,8 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $homeBtn = $win.FindName('HomeBtn')
     $recentsBtn = $win.FindName('RecentsBtn')
     $navLabel = $win.FindName('NavLabel')
+    $phoneModeBtn = $win.FindName('PhoneModeBtn')
+    $tabletModeBtn = $win.FindName('TabletModeBtn')
 
     $wb = New-Object System.Windows.Media.Imaging.WriteableBitmap($srcW, $srcH, 96, 96, [System.Windows.Media.PixelFormats]::Bgr32, $null)
     $image.Source = $wb
@@ -2374,6 +2574,9 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.Wb = $wb
 
     if ($null -ne $loadingIcon) { $loadingIcon.Source = $script:appIcon }
+
+    $phoneModeBtn.Add_Click({ Invoke-Safe 'phoneMode' { Set-LiveDisplayMode $w 'phone' } })
+    $tabletModeBtn.Add_Click({ Invoke-Safe 'tabletMode' { Set-LiveDisplayMode $w 'tablet' } })
 
     $win.Add_SizeChanged({
         param($sender, $e)
@@ -2459,8 +2662,15 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         try {
             $p = Map-WrapperPoint $w $e.GetPosition($sender)
             if ($null -eq $p) { return }
-            $dy = if ($e.Delta -gt 0) { -320 } else { 320 }
-            Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1] + $dy) 220"
+            # Accumulate notch deltas: a proportional swipe is much smoother
+            # than one fixed jump per notch, and slow trackpads do not get
+            # ignored altogether.
+            $acc = [int]$w.WheelAcc + [int]$e.Delta
+            if ([Math]::Abs($acc) -lt 120) { $w.WheelAcc = $acc; return }
+            $steps = [int]([Math]::Round($acc / 120.0))
+            $dy = -([Math]::Max(1, [Math]::Min(5, [Math]::Abs($steps)))) * 150
+            $w.WheelAcc = $acc - ($steps * 120)
+            Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1] + $dy) 180"
         } catch { }
     })
     $backBtn.Add_Click({
@@ -2565,6 +2775,22 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     return $w
 }
 
+# Extract app icons one at a time in the background. The slow ADB calls no
+# longer block the manager window during a refresh.
+$iconTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$iconTimer.Interval = [TimeSpan]::FromMilliseconds(600)
+$iconTimer.Add_Tick({
+    Invoke-Safe 'iconTimer' {
+        if ($script:iconQueue.Count -eq 0) { $iconTimer.Stop(); return }
+        $pkg = [string]$script:iconQueue.Dequeue()
+        $frame = Get-AppIconPath ([pscustomobject]@{ Package = $pkg })
+        foreach ($item in $script:apps) {
+            if ([string]$item.Package -eq $pkg) { $item.Icon = $frame }
+        }
+        try { $appsList.Items.Refresh() } catch { }
+    }
+})
+
 $script:bounceTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:bounceTimer.Interval = [TimeSpan]::FromMilliseconds(180)
 $script:bounceTimer.Add_Tick({
@@ -2584,6 +2810,11 @@ $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(40)
 $script:frameTimer.Add_Tick({
     try {
+        $beatNow = [DateTime]::UtcNow
+        if (($beatNow - $script:lastHeartbeat).TotalSeconds -ge 10) {
+            $script:lastHeartbeat = $beatNow
+            try { [System.IO.File]::WriteAllText($script:heartbeatPath, $beatNow.ToString('o')) } catch { }
+        }
         $list = $script:wrappers
         $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
         for ($i = $list.Count - 1; $i -ge 0; $i--) {
@@ -2814,6 +3045,14 @@ function Start-AppLaunch($app) {
         # Russian system while the raw Android window stayed on the desktop.
         WindowMatch = $app.Name
     }
+    if ($script:rememberMode -and $null -ne $app -and -not [string]::IsNullOrWhiteSpace([string]$app.Package)) {
+        $script:appModes[[string]$app.Package] = [int]$sizeBox.SelectedIndex
+        Save-AppModes
+    }
+
+    # Wake a frozen runtime first, otherwise wm size/density and the launch
+    # itself would silently hang.
+    Ensure-WaydroidAwake | Out-Null
 
     # Apply the display mode picked in the manager before the app starts:
     # phone = portrait + phone density, tablet = landscape + tablet density.
@@ -3057,11 +3296,11 @@ function Get-AppIconPath($app) {
                 $state = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'get-state') -TimeoutMs 6000
             }
             if ($state -match '^device') {
-                $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs 10000
+                $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'push', $dex, $remoteDex) -TimeoutMs $script:adbTimeoutMs
                 $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
-                $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs 10000
+                $res = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', $cmd) -TimeoutMs $script:adbTimeoutMs
                 if ($res -match 'OK') {
-                    $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'pull', $remotePng, $localPng) -TimeoutMs 10000
+                    $null = Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'pull', $remotePng, $localPng) -TimeoutMs $script:adbTimeoutMs
                     if (Test-Path -LiteralPath $localPng) { $ok = $true }
                 }
             }
@@ -3079,11 +3318,11 @@ function Get-AppIconPath($app) {
             if ($r.Code -eq 0 -and $r.Out -match 'device') {
                 $linuxDex = ConvertTo-WslPath $dex
                 $linuxPng = ConvertTo-WslPath $localPng
-                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) 10000
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'push', $linuxDex, $remoteDex)) $script:adbTimeoutMs
                 $cmd = "CLASSPATH=$remoteDex app_process /system/bin WinoidIcon $($app.Package) $remotePng"
-                $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) 10000
+                $res = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', $cmd)) $script:adbTimeoutMs
                 if ($res.Out -match 'OK') {
-                    $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'pull', $remotePng, $linuxPng)) 10000
+                    $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'pull', $remotePng, $linuxPng)) $script:adbTimeoutMs
                     if (Test-Path -LiteralPath $localPng) { $ok = $true }
                 }
             }
@@ -3416,11 +3655,22 @@ $refreshBtn.Add_Click({
 })
 $appsList.Add_SelectionChanged({
     Invoke-Safe 'selection' {
-        $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
-        $shortcutBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
-        $uninstallBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+        $sel = $appsList.SelectedItem
+        $launchBtn.IsEnabled = ($null -ne $sel)
+        $shortcutBtn.IsEnabled = ($null -ne $sel)
+        $uninstallBtn.IsEnabled = ($null -ne $sel)
+        # Restore the mode remembered for this app, if any.
+        if ($script:rememberMode -and $null -ne $sel) {
+            $pkg = [string]$sel.Package
+            if ($script:appModes.ContainsKey($pkg)) {
+                $idx = [int]$script:appModes[$pkg]
+                if ($idx -ge 0 -and $idx -lt $sizeBox.Items.Count) { $sizeBox.SelectedIndex = $idx }
+            }
+        }
     }
 })
+$rememberModeCheck.Add_Checked({ Invoke-Safe 'rememberMode' { $script:rememberMode = $true; Save-AppModes } })
+$rememberModeCheck.Add_Unchecked({ Invoke-Safe 'rememberMode' { $script:rememberMode = $false; Save-AppModes } })
 $appsList.Add_MouseDoubleClick({
     Invoke-Safe 'doubleClick' {
         if ($null -ne $appsList.SelectedItem) { Start-AppLaunch $appsList.SelectedItem }
@@ -3437,29 +3687,134 @@ $myComputerBtn.Add_Click({ Invoke-Safe 'myComputerBtn' {
         Set-Footer "Не удалось открыть проводник: $($_.Exception.Message)"
     }
 } })
-$uninstallBtn.Add_Click({ Invoke-Safe 'uninstallBtn' {
-    $app = $appsList.SelectedItem
-    if ($null -eq $app) { return }
-    $name = [string]$app.Name
-    $pkg = [string]$app.Package
-    $answer = [System.Windows.MessageBox]::Show("Удалить приложение «$name»?`n$pkg`n`nПриложение и его данные будут удалены из Android.", 'Winoid — удаление приложения', 'YesNo', 'Warning', 'No')
-    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
-    Set-Footer "Удаление $name…"
-    try {
-        $r = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'uninstall', $pkg)) 45000
-        $out = (($r.Out + ' ' + $r.Err) -replace "`r?`n", ' ').Trim()
-        Write-WinoidLog "uninstall $pkg : $out"
-        if ($out -match 'Success') {
-            $ico = Join-Path (Join-Path $script:dataRoot 'icons') ($pkg + '.ico')
-            Remove-Item -LiteralPath $ico -Force -ErrorAction SilentlyContinue
-            Set-Footer "Приложение «$name» удалено."
-        } else {
-            Set-Footer "Не удалось удалить «$name»: $out"
+$deleteApkBtn.Add_Click({ Invoke-Safe 'deleteApkBtn' {
+    $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+    $dlg.Title = 'Выберите APK-файл для удаления'
+    $dlg.Filter = 'Android package (*.apk)|*.apk'
+    if ($dlg.ShowDialog($window) -eq $true) {
+        $file = $dlg.FileName
+        $answer = [System.Windows.MessageBox]::Show("Удалить файл?`n$file", 'Winoid — удаление APK', 'YesNo', 'Warning', 'No')
+        if ($answer -eq [System.Windows.MessageBoxResult]::Yes) {
+            try {
+                Remove-Item -LiteralPath $file -Force
+                Write-WinoidLog "deleted apk: $file"
+                Set-Footer 'APK-файл удалён.'
+            } catch { Set-Footer "Не удалось удалить файл: $($_.Exception.Message)" }
         }
-    } catch {
-        Write-WinoidLog ("ERROR uninstall: " + $_.Exception.ToString())
-        Set-Footer "Ошибка удаления: $($_.Exception.Message)"
     }
+} })
+$exportCfgBtn.Add_Click({ Invoke-Safe 'exportCfg' {
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new()
+    $dlg.Title = 'Экспорт настроек Winoid'
+    $dlg.Filter = 'JSON (*.json)|*.json'
+    $dlg.FileName = 'winoid-settings.json'
+    if ($dlg.ShowDialog($window) -eq $true) {
+        $bundle = [pscustomobject]@{
+            config = Read-JsonFile (Join-Path $script:dataRoot 'config.json')
+            apps = Read-JsonFile (Join-Path $script:dataRoot 'apps.json')
+            modes = Read-JsonFile (Join-Path $script:dataRoot 'modes.json')
+        }
+        $bundle | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8NoBOM
+        Set-Footer 'Настройки экспортированы.'
+    }
+} })
+$importCfgBtn.Add_Click({ Invoke-Safe 'importCfg' {
+    $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+    $dlg.Title = 'Импорт настроек Winoid'
+    $dlg.Filter = 'JSON (*.json)|*.json'
+    if ($dlg.ShowDialog($window) -eq $true) {
+        $b = Get-Content -LiteralPath $dlg.FileName -Raw -Encoding utf8 | ConvertFrom-Json
+        foreach ($name in @('config', 'apps', 'modes')) {
+            $prop = $b.PSObject.Properties[$name]
+            if ($null -ne $prop -and $null -ne $prop.Value) {
+                $prop.Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $script:dataRoot ($name + '.json')) -Encoding utf8NoBOM
+            }
+        }
+        Set-Footer 'Настройки импортированы. Перезапустите Winoid.'
+    }
+} })
+$diagBtn.Add_Click({ Invoke-Safe 'diagBtn' { Show-Diagnostics } })
+$updateBtn.Add_Click({ Invoke-Safe 'updateBtn' {
+    Set-Footer 'Проверка обновлений…'
+    try {
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Sergey35853/winoid/releases/latest' -TimeoutSec 15 -Headers @{ 'User-Agent' = 'Winoid' }
+        $tag = [string]$release.tag_name
+        if ($tag -match '(\d+\.\d+\.\d+)') {
+            $latest = [version]$matches[1]
+            if ($latest -gt [version]$script:appVersion) {
+                Set-Footer "Доступна версия $tag — открываю страницу релиза."
+                if ($release.html_url) { Start-Process ([string]$release.html_url) }
+            } else {
+                Set-Footer "У вас актуальная версия $($script:appVersion)."
+            }
+        }
+    } catch { Set-Footer "Не удалось проверить обновления: $($_.Exception.Message)" }
+} })
+$diagRefreshBtn.Add_Click({ Invoke-Safe 'diagRefresh' { Show-Diagnostics } })
+$diagOpenLogBtn.Add_Click({ Invoke-Safe 'diagLog' {
+    $log = Join-Path $script:dataRoot 'winoid.log'
+    if (Test-Path -LiteralPath $log) { Start-Process -FilePath 'notepad.exe' -ArgumentList $log }
+} })
+$diagCloseBtn.Add_Click({ Invoke-Safe 'diagClose' { $diagWindow.Hide() } })
+$window.Add_KeyDown({
+    param($sender, $e)
+    try {
+        if ($e.Key -eq 'F1') { Show-Diagnostics; $e.Handled = $true; return }
+        $ctrl = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+        if ($ctrl -and $e.Key -eq 'R') {
+            Invoke-Safe 'hotkey.refresh' { Test-Session | Out-Null; Refresh-Apps }
+            $e.Handled = $true; return
+        }
+        if ($e.Key -eq 'Delete' -and $appsList.SelectedItems.Count -gt 0) {
+            $uninstallBtn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.ButtonBase]::ClickEvent))
+            $e.Handled = $true
+        }
+    } catch { }
+})
+$uninstallBtn.Add_Click({ Invoke-Safe 'uninstallBtn' {
+    $apps = @($appsList.SelectedItems)
+    if ($apps.Count -eq 0) { return }
+    $names = ($apps | ForEach-Object { '• ' + [string]$_.Name + ' (' + [string]$_.Package + ')' }) -join "`n"
+    $answer = [System.Windows.MessageBox]::Show("Удалить выбранные приложения?`n$names`n`nПриложения и их данные будут удалены из Android.", 'Winoid — удаление приложения', 'YesNo', 'Warning', 'No')
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    if (-not (Ensure-WaydroidAwake)) { Set-Footer 'Android не отвечает — удаление отменено.'; return }
+    $done = 0; $failed = 0
+    foreach ($app in $apps) {
+        $name = [string]$app.Name
+        $pkg = [string]$app.Package
+        Set-Footer "Удаление $name…"
+        try {
+            $r = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'uninstall', $pkg)) 45000
+            $out = (($r.Out + ' ' + $r.Err) -replace "`r?`n", ' ').Trim()
+            Write-WinoidLog "uninstall $pkg : $out"
+            if ($out -match 'Success') {
+                $done++
+                $ico = Join-Path (Join-Path $script:dataRoot 'icons') ($pkg + '.ico')
+                Remove-Item -LiteralPath $ico -Force -ErrorAction SilentlyContinue
+                $safe = ([string]$app.Name -replace '[\\/:*?"<>|]', '_').Trim().TrimEnd('.')
+                if ([string]::IsNullOrWhiteSpace($safe)) { $safe = $pkg }
+                if ($safe.Length -gt 64) { $safe = $safe.Substring(0, 64).Trim() }
+                $desktop = [Environment]::GetFolderPath('Desktop')
+                foreach ($lnkName in @(($safe + '.lnk'), ($safe + ' (' + $pkg + ').lnk'))) {
+                    Remove-Item -LiteralPath (Join-Path $desktop $lnkName) -Force -ErrorAction SilentlyContinue
+                }
+                if ($script:appModes.ContainsKey($pkg)) { $script:appModes.Remove($pkg); Save-AppModes }
+            } else { $failed++ }
+        } catch {
+            $failed++
+            Write-WinoidLog ("ERROR uninstall: " + $_.Exception.ToString())
+        }
+    }
+    # Drop removed packages from the cached list in one pass.
+    $cache = Join-Path $script:dataRoot 'apps.json'
+    if (Test-Path -LiteralPath $cache) {
+        try {
+            $gone = @($apps | ForEach-Object { [string]$_.Package })
+            $left = @(Get-Content -LiteralPath $cache -Raw -Encoding utf8 | ConvertFrom-Json | Where-Object { $gone -notcontains [string]$_.Package })
+            $left | ConvertTo-Json -Depth 3 -Compress | Set-Content -LiteralPath $cache -Encoding utf8NoBOM
+        } catch { }
+    }
+    Set-Footer "Удалено: $done. Не удалось: $failed."
     Refresh-Apps
 } })
 $installBtn.Add_Click({
@@ -3544,6 +3899,7 @@ $window.Add_Drop({
 })
 $window.Add_Closing({
     $script:exiting = $true
+    try { [System.IO.File]::WriteAllText($script:shutdownPath, (Get-Date).ToString('o')) } catch { }
     Invoke-Safe 'closing.timers' {
         $launchTimer.Stop()
         $installTimer.Stop()
@@ -3552,6 +3908,7 @@ $window.Add_Closing({
         $driveTimer.Stop()
         $script:frameTimer.Stop()
         $script:bounceTimer.Stop()
+        $iconTimer.Stop()
     }
     Invoke-Safe 'closing.drive' { Disconnect-AndroidDrive }
     foreach ($w in @($script:wrappers)) {

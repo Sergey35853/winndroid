@@ -1,13 +1,8 @@
 @echo off
 setlocal
-set "APP=%~dp0Winoid.ps1"
+set "APP=%~dp0WinoidLauncher.exe"
 if not exist "%APP%" (
-    echo Winoid.ps1 was not found next to this launcher.
-    pause
-    exit /b 1
-)
-if not exist "%~dp0Winoid.vbs" (
-    echo Winoid.vbs was not found next to this launcher.
+    echo WinoidLauncher.exe was not found next to this launcher.
     pause
     exit /b 1
 )
@@ -18,5 +13,5 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-start "" wscript.exe //B "%~dp0Winoid.vbs" %*
+start "" "%APP%" %*
 exit /b 0

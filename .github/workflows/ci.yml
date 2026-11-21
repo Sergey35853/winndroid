@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches-ignore:
+      - 'releases/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'Winoid.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error ("{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            exit 1
+          }
+          Write-Host 'PowerShell syntax OK'
+
+      - name: Smoke tests
+        shell: pwsh
+        run: ./tests/Winoid.Tests.ps1
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer (dev version)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=0.0.0-dev" "installer\Winoid.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: Winoid-ci
+          path: dist/*
+          if-no-files-found: error
