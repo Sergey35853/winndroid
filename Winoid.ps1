@@ -745,6 +745,8 @@ $mainXaml = @'
         <Button x:Name="LaunchBtn" Style="{StaticResource Primary}" Content="Запустить в отдельном окне" IsEnabled="False"/>
         <Button x:Name="ShortcutBtn" Content="Ярлык на рабочем столе" IsEnabled="False"/>
         <Button x:Name="DriveBtn" Content="Открыть диск Android"/>
+        <Button x:Name="MyComputerBtn" Content="Мой компьютер" ToolTip="Открыть проводник Windows: Этот компьютер (shell:MyComputerFolder)"/>
+        <Button x:Name="UninstallBtn" Content="Удалить приложение (APK)" IsEnabled="False" ToolTip="Удалить выбранное приложение из Android"/>
         <Button x:Name="FullUiBtn" Content="Перезапустить Android"/>
         <Button x:Name="SettingsBtn" Content="Настройки Android"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
@@ -753,6 +755,8 @@ $mainXaml = @'
         <TextBlock Text="Размер нового окна" FontSize="12" Foreground="#8D929C" Margin="2,0,0,6"/>
         <ComboBox x:Name="SizeBox" Background="#26282F" Foreground="#F1F3F5" BorderBrush="#34363E" Padding="8,6" Margin="0,0,0,12">
           <ComboBoxItem Content="Как есть (на весь экран)" IsSelected="True"/>
+          <ComboBoxItem Content="Телефон — вертикально (720 × 1280)"/>
+          <ComboBoxItem Content="Планшет — горизонтально (1280 × 800)"/>
           <ComboBoxItem Content="1280 × 800"/>
           <ComboBoxItem Content="1600 × 900"/>
           <ComboBoxItem Content="1920 × 1080"/>
@@ -907,6 +911,8 @@ $appsList      = $window.FindName('AppsList')
 $launchBtn     = $window.FindName('LaunchBtn')
 $shortcutBtn   = $window.FindName('ShortcutBtn')
 $driveBtn      = $window.FindName('DriveBtn')
+$myComputerBtn = $window.FindName('MyComputerBtn')
+$uninstallBtn  = $window.FindName('UninstallBtn')
 $fullUiBtn     = $window.FindName('FullUiBtn')
 $settingsBtn   = $window.FindName('SettingsBtn')
 $installBtn    = $window.FindName('InstallBtn')
@@ -1424,6 +1430,7 @@ function Update-AppFilter {
     if ($view.Count -gt 0) { $appsList.SelectedIndex = 0 }
     $launchBtn.IsEnabled = ($view.Count -gt 0)
     $shortcutBtn.IsEnabled = ($view.Count -gt 0)
+    $uninstallBtn.IsEnabled = ($view.Count -gt 0)
 }
 
 function Get-LauncherApps {
@@ -1552,10 +1559,14 @@ function Refresh-Apps {
 
 function Get-SelectedSize {
     switch ($sizeBox.SelectedIndex) {
-        1 { return [pscustomobject]@{ Width = 1280; Height = 800 } }
-        2 { return [pscustomobject]@{ Width = 1600; Height = 900 } }
-        3 { return [pscustomobject]@{ Width = 1920; Height = 1080 } }
-        default { return $null }
+        # Phone: narrow portrait surface with a phone-like density.
+        1 { return [pscustomobject]@{ Width = 720; Height = 1280; Density = 320; Reset = $false } }
+        # Tablet: wide landscape surface with a tablet-like density.
+        2 { return [pscustomobject]@{ Width = 1280; Height = 800; Density = 160; Reset = $false } }
+        3 { return [pscustomobject]@{ Width = 1280; Height = 800; Density = 0; Reset = $false } }
+        4 { return [pscustomobject]@{ Width = 1600; Height = 900; Density = 0; Reset = $false } }
+        5 { return [pscustomobject]@{ Width = 1920; Height = 1080; Density = 0; Reset = $false } }
+        default { return [pscustomobject]@{ Width = 0; Height = 0; Density = 0; Reset = $true } }
     }
 }
 
@@ -2522,7 +2533,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     [void]$script:wrappers.Add($w)
 
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    if ($null -ne $size) { $cw = [int]$size.Width; $ch = [int]$size.Height }
+    if ($null -ne $size -and [int]$size.Width -gt 0) { $cw = [int]$size.Width; $ch = [int]$size.Height }
     elseif ($app.Package -eq 'com.android.settings') {
         # Settings is a two-pane 2560x1392 desktop. At full size it would be
         # wider than most monitors, so show it at a comfortable default width.
@@ -2804,12 +2815,20 @@ function Start-AppLaunch($app) {
         WindowMatch = $app.Name
     }
 
-    # Apply the window size picked in the manager (phone / tablet) to the
-    # Android display before the app starts, so the launched surface really
-    # uses that geometry instead of falling back to the phone-sized default.
-    if ($null -ne $script:launchState.Size) {
-        $sz = $script:launchState.Size
-        try { Send-Android "wm size $($sz.Width)x$($sz.Height)" } catch { }
+    # Apply the display mode picked in the manager before the app starts:
+    # phone = portrait + phone density, tablet = landscape + tablet density.
+    # "Как есть" restores the Android defaults instead of leaving the last mode.
+    $sizeChoice = $script:launchState.Size
+    if ($null -ne $sizeChoice) {
+        if ($sizeChoice.Reset) {
+            try { Send-Android 'wm size reset' } catch { }
+            try { Send-Android 'wm density reset' } catch { }
+        } else {
+            try { Send-Android "wm size $($sizeChoice.Width)x$($sizeChoice.Height)" } catch { }
+            if ([int]$sizeChoice.Density -gt 0) {
+                try { Send-Android "wm density $($sizeChoice.Density)" } catch { }
+            }
+        }
         Start-Sleep -Milliseconds 600
     }
 
@@ -3399,6 +3418,7 @@ $appsList.Add_SelectionChanged({
     Invoke-Safe 'selection' {
         $launchBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
         $shortcutBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
+        $uninstallBtn.IsEnabled = ($null -ne $appsList.SelectedItem)
     }
 })
 $appsList.Add_MouseDoubleClick({
@@ -3409,6 +3429,39 @@ $appsList.Add_MouseDoubleClick({
 $launchBtn.Add_Click({ Invoke-Safe 'launchBtn' { Start-AppLaunch $appsList.SelectedItem } })
 $shortcutBtn.Add_Click({ Invoke-Safe 'shortcutBtn' { New-AppShortcut $appsList.SelectedItem } })
 $driveBtn.Add_Click({ Invoke-Safe 'driveBtn' { Mount-AndroidDrive -Open | Out-Null } })
+$myComputerBtn.Add_Click({ Invoke-Safe 'myComputerBtn' {
+    try {
+        Start-Process -FilePath 'explorer.exe' -ArgumentList 'shell:MyComputerFolder'
+        Set-Footer 'Открыл «Этот компьютер» в проводнике Windows.'
+    } catch {
+        Set-Footer "Не удалось открыть проводник: $($_.Exception.Message)"
+    }
+} })
+$uninstallBtn.Add_Click({ Invoke-Safe 'uninstallBtn' {
+    $app = $appsList.SelectedItem
+    if ($null -eq $app) { return }
+    $name = [string]$app.Name
+    $pkg = [string]$app.Package
+    $answer = [System.Windows.MessageBox]::Show("Удалить приложение «$name»?`n$pkg`n`nПриложение и его данные будут удалены из Android.", 'Winoid — удаление приложения', 'YesNo', 'Warning', 'No')
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    Set-Footer "Удаление $name…"
+    try {
+        $r = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'uninstall', $pkg)) 45000
+        $out = (($r.Out + ' ' + $r.Err) -replace "`r?`n", ' ').Trim()
+        Write-WinoidLog "uninstall $pkg : $out"
+        if ($out -match 'Success') {
+            $ico = Join-Path (Join-Path $script:dataRoot 'icons') ($pkg + '.ico')
+            Remove-Item -LiteralPath $ico -Force -ErrorAction SilentlyContinue
+            Set-Footer "Приложение «$name» удалено."
+        } else {
+            Set-Footer "Не удалось удалить «$name»: $out"
+        }
+    } catch {
+        Write-WinoidLog ("ERROR uninstall: " + $_.Exception.ToString())
+        Set-Footer "Ошибка удаления: $($_.Exception.Message)"
+    }
+    Refresh-Apps
+} })
 $installBtn.Add_Click({
     Invoke-Safe 'installBtn' {
         $dlg = [Microsoft.Win32.OpenFileDialog]::new()
