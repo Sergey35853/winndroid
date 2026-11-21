@@ -447,7 +447,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.18'
+$script:appVersion = '0.1.19'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:hideCaption = $true
 $script:captionHeightPx = 48
@@ -2625,6 +2625,8 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.LastMoveT = [DateTime]::MinValue
     $w.LoadingIcon = $null
     $w.WheelAcc = 0
+    $w.WheelLogSign = 0
+    $w.ParkSweepAt = $null
     # The onboarding hint covers game UI until the first tap; hide it by
     # itself after a few seconds so screenshots and idle windows stay clean.
     $w.HintUntil = [DateTime]::UtcNow.AddSeconds(8)
@@ -2750,8 +2752,17 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             $acc = [int]$w.WheelAcc + [int]$e.Delta
             if ([Math]::Abs($acc) -lt 120) { $w.WheelAcc = $acc; return }
             $steps = [int]([Math]::Round($acc / 120.0))
-            $dy = -([Math]::Max(1, [Math]::Min(5, [Math]::Abs($steps)))) * 150
+            $dir = [Math]::Sign($steps)
+            if ($dir -eq 0) { $dir = $(if ($acc -gt 0) { 1 } else { -1 }) }
+            $mag = [Math]::Max(1, [Math]::Min(5, [Math]::Abs($steps)))
+            # Wheel up (positive Delta) must swipe DOWN so the document scrolls
+            # up; wheel down swipes up. The old code always swiped up.
+            $dy = $dir * $mag * 150
             $w.WheelAcc = $acc - ($steps * 120)
+            if ($w.WheelLogSign -ne $dir) {
+                $w.WheelLogSign = $dir
+                Write-WinoidLog "wheel dir=$dir delta=$($e.Delta) dy=$dy"
+            }
             Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1] + $dy) 180"
         } catch { }
     })
@@ -2899,6 +2910,7 @@ $script:frameTimer.Add_Tick({
         }
         $list = $script:wrappers
         $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
         for ($i = $list.Count - 1; $i -ge 0; $i--) {
             if ($i -ge $list.Count) { continue }
             $w = $list[$i]
@@ -2962,6 +2974,49 @@ $script:frameTimer.Add_Tick({
                 [void][NativeWin]::GetWindowRect($extra.Source, [ref]$er)
                 if ([math]::Abs($er.Left - $extra.ParkX) -gt 1 -or [math]::Abs($er.Top - $extra.ParkY) -gt 1) {
                     [void][NativeWin]::SetWindowPos($extra.Source, [IntPtr]::Zero, $extra.ParkX, $extra.ParkY, $extra.W, $extra.H, 0x0010)
+                }
+            }
+            # Android can create a new base window with its own caption after
+            # the wrapper exists. Park such late surfaces so the raw Android
+            # window with '<' and window buttons is not visible behind Winoid.
+            $sweepAt = $null
+            try { $sweepAt = [DateTime]$w.ParkSweepAt } catch { }
+            if ($null -eq $sweepAt -or ([DateTime]::UtcNow - $sweepAt).TotalMilliseconds -ge 700) {
+                $w.ParkSweepAt = [DateTime]::UtcNow
+                $rootOwner = [NativeWin]::GetAncestor($w.Source, 3)
+                $known = New-Object 'System.Collections.Generic.HashSet[System.IntPtr]'
+                [void]$known.Add($w.Source)
+                foreach ($pane in @($w.Panes)) { [void]$known.Add($pane.Source) }
+                foreach ($extra in @($w.Parked)) { [void]$known.Add($extra.Source) }
+                foreach ($proc in @(Get-Process msrdc -ErrorAction SilentlyContinue)) {
+                    $late = @()
+                    try { $late = @([NativeWin]::ListWindows([uint32]$proc.Id)) } catch { }
+                    foreach ($wnd in $late) {
+                        if ($null -eq $wnd -or -not $wnd.Visible) { continue }
+                        if ($wnd.Width -lt 40 -or $wnd.Height -lt 40) { continue }
+                        if ($known.Contains($wnd.Hwnd)) { continue }
+                        if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $rootOwner) { continue }
+                        $lr = New-Object NativeWin+RECT
+                        [void][NativeWin]::GetWindowRect($wnd.Hwnd, [ref]$lr)
+                        if ([int]$lr.Left -ge $vs.Right - 50) { continue }
+                        $oldEx = [NativeWin]::GetWindowLong($wnd.Hwnd, -20)
+                        $zoomed = [NativeWin]::IsZoomed($wnd.Hwnd)
+                        $px = $vs.Right + 200 + [int]$w.Parked.Count * 8
+                        if ($zoomed) { [void][NativeWin]::ShowWindow($wnd.Hwnd, 9) }
+                        [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, (($oldEx -bor 0x00000080) -band (-bnot 0x00040000)))
+                        [void]$w.Parked.Add([pscustomobject]@{
+                            Source = $wnd.Hwnd
+                            OrigExStyle = (($oldEx -bor 0x00040000) -band (-bnot 0x00000080))
+                            OrigRect = $lr
+                            WasZoomed = $zoomed
+                            ParkX = $px
+                            ParkY = 0
+                            W = [int]$wnd.Width
+                            H = [int]$wnd.Height
+                        })
+                        [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, $px, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
+                        Write-WinoidLog "parked late surface: $($wnd.Title)"
+                    }
                 }
             }
             if (-not $capture -or $lumaRows -eq 0) { continue }
